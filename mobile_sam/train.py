@@ -1,4 +1,3 @@
-# train_mobilesam_shadow.py
 from typing import Dict, List, Optional, Tuple
 import os
 import math
@@ -11,36 +10,14 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import numpy as np
 from PIL import Image
+from typing import Any
+import wandb
+from dotenv import load_dotenv
 
-# Change these imports to your actual module/file names:
-from mobile_sam.utils.dataset import SBUShadowDataset, sbu_collate  # <- your dataset from previous step
+# from mobile_sam.utils.sbu_dataset import SBUShadowDataset, sbu_collate
+from mobile_sam.utils.obj_prompt_shadow_dataset import ObjPromptShadowDataset, two_mask_collate
 from mobile_sam.build_sam import sam_model_registry
-
-def sam_denormalize(img_t: torch.Tensor) -> np.ndarray:
-    mean = torch.tensor([123.675, 116.28, 103.53], device=img_t.device).view(3, 1, 1)
-    std = torch.tensor([58.395, 57.12, 57.375], device=img_t.device).view(3, 1, 1)
-    x = (img_t * std + mean) / 255.0
-    x = x.clamp(0.0, 1.0)
-    x = (x.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-    return x
-
-def color_overlay(img: np.ndarray, mask: np.ndarray, color: Tuple[int, int, int], alpha: float = 0.45) -> np.ndarray:
-    out = img.copy()
-    overlay = np.zeros_like(out, dtype=np.uint8)
-    overlay[mask.astype(bool)] = color
-    out = (out.astype(np.float32) * (1 - alpha) + overlay.astype(np.float32) * alpha).astype(np.uint8)
-    return out
-
-def make_panel(img: np.ndarray, gt: np.ndarray, pred: np.ndarray) -> Image.Image:
-    left = Image.fromarray(img)
-    mid = Image.fromarray(color_overlay(img, gt, (0, 255, 0)))
-    right = Image.fromarray(color_overlay(img, pred, (255, 0, 0)))
-    w, h = left.size
-    canvas = Image.new("RGB", (w * 3, h))
-    canvas.paste(left, (0, 0))
-    canvas.paste(mid, (w, 0))
-    canvas.paste(right, (2 * w, 0))
-    return canvas
+from mobile_sam.utils.common import sam_denormalize, color_overlay, make_panel, make_panel_with_points
 
 
 class ShadowLoss(nn.Module):
@@ -61,7 +38,7 @@ class ShadowLoss(nn.Module):
 
 
 @torch.no_grad()
-def compute_metrics(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5) -> Dict[str, float]:
+def compute_metrics(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5, obj_mask: torch.Tensor = None) -> Dict[str, float]:
     probs = torch.sigmoid(logits)
     pred = (probs >= thr).float()
     tp = (pred * target).sum().item()
@@ -73,7 +50,15 @@ def compute_metrics(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5
     rec = tp / max(1.0, (tp + fn))
     f1 = 2 * prec * rec / max(1e-6, (prec + rec))
     ber = 0.5 * (fn / max(1.0, tp + fn) + fp / max(1.0, tn + fp))
-    return {"iou": iou, "f1": f1, "ber": ber}
+    metrics = {"iou": iou, "f1": f1, "ber": ber}
+    if obj_mask is not None:
+        shadow_pred = (pred - obj_mask).clamp(min=0)
+        shadow_gt = (target - obj_mask).clamp(min=0)
+        intersection = (shadow_pred * shadow_gt).sum().item()
+        union = ((shadow_pred + shadow_gt) > 0).float().sum().item()
+        shadow_iou = intersection / max(1.0, union)
+        metrics["shadow_iou"] = shadow_iou
+    return metrics
 
 
 def set_seed(seed: int) -> None:
@@ -124,7 +109,7 @@ def forward_mobile_sam(
 
     logits_out: List[torch.Tensor] = []
 
-    for i in tqdm(range(B)):
+    for i in range(B):
         # Prepare prompts for sample i
         pts_i = points[i]
         lbs_i = point_labels[i]
@@ -188,6 +173,8 @@ class Trainer:
         vis_dir: Optional[str] = None,
         vis_every: int = 5,
         vis_num: int = 8,
+        wandb_run: Optional[Any] = None,
+        wandb_images: int = 16
     ) -> None:
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -202,52 +189,68 @@ class Trainer:
         self.device = device
         enable_amp = bool(amp and self.device == "cuda")
         try:
-            # PyTorch 2.x (nowe API) – pierwszy argument to device ('cuda'/'cpu')
             self.scaler = torch.amp.GradScaler(self.device, enabled=enable_amp)
         except TypeError:
-            # Starsze warianty – bez parametru device
             self.scaler = torch.amp.GradScaler(enabled=enable_amp)
         self.vis_dir = vis_dir
         self.vis_every = vis_every
         self.vis_num = vis_num
+        self.wandb = wandb_run
+        self.wandb_images = wandb_images
 
     
     def save_predictions(self, epoch: int) -> None:
         if not self.vis_dir:
             return
-        os.makedirs(self.vis_dir, exist_ok=True)
+        out_dir = os.path.join(self.vis_dir, f"epoch_{epoch:03d}")
+        os.makedirs(out_dir, exist_ok=True)
+
         loader = self.val_loader if self.val_loader is not None else self.train_loader
         self.model.eval()
+
         saved = 0
+        wb_imgs: List[Any] = []
+
         with torch.no_grad():
-            for batch in loader:
-                print(f"Visualizing batch, saved {saved}/{self.vis_num} images...")
+            for b_idx, batch in enumerate(loader):
                 images = batch["image"].to(self.device, non_blocking=True)
                 masks = batch["mask"].to(self.device, non_blocking=True)
                 points = [p.to(self.device) for p in batch["points"]]
                 labels = [l.to(self.device) for l in batch["point_labels"]]
                 boxes = [b.to(self.device) for b in batch["boxes"]]
+
                 logits = forward_mobile_sam(self.model, images, points, labels, boxes)
                 probs = torch.sigmoid(logits)
+
                 B = images.size(0)
                 for i in range(B):
-                    # if saved >= self.vis_num:
-                    #     break
                     img_np = sam_denormalize(images[i])
                     gt = (masks[i, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
                     pr = (probs[i, 0].detach().cpu().numpy() >= 0.5).astype(np.uint8)
-                    panel = make_panel(img_np, gt, pr)
-                    out_path = os.path.join(self.vis_dir, f"epoch_{epoch:03d}_{saved:03d}.png")
+
+                    pts = points[i].detach().cpu().numpy() if points[i].numel() > 0 else np.zeros((0,2))
+                    panel = make_panel_with_points(img_np, gt, pr, pts)
+
+                    out_path = os.path.join(out_dir, f"b{b_idx:05d}_i{i:02d}.png")
                     panel.save(out_path)
                     saved += 1
-                # if saved >= self.vis_num:
-                    # break
+
+                    if self.wandb and (self.wandb_images < 0 or len(wb_imgs) < self.wandb_images):
+                        wb_imgs.append(wandb.Image(panel, caption=f"epoch_{epoch:03d}_b{b_idx:05d}_i{i:02d}"))
+
+                if self.vis_num >= 0 and saved >= self.vis_num:
+                    break
+
+        if self.wandb and wb_imgs:
+            self.wandb.log({"predictions": wb_imgs}, step=epoch)
+
+        print(f"[Vis] Saved {saved} images to {out_dir}")
         self.model.train()
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
         total_loss, n_batches = 0.0, 0
-        for batch in self.train_loader:
+        for batch in tqdm(self.train_loader):
             images = batch["image"].to(self.device, non_blocking=True)
             masks = batch["mask"].to(self.device, non_blocking=True)
             points = [p.to(self.device) for p in batch["points"]]
@@ -277,51 +280,72 @@ class Trainer:
             return {"val_loss": math.nan, "val_iou": math.nan, "val_f1": math.nan, "val_ber": math.nan}
         self.model.eval()
         total_loss, n_batches = 0.0, 0
-        agg = {"iou": 0.0, "f1": 0.0, "ber": 0.0}
+        agg = {"iou": 0.0, "f1": 0.0, "ber": 0.0, "shadow_iou": 0.0}
         for batch in self.val_loader:
             images = batch["image"].to(self.device, non_blocking=True)
             masks = batch["mask"].to(self.device, non_blocking=True)
             points = [p.to(self.device) for p in batch["points"]]
             labels = [l.to(self.device) for l in batch["point_labels"]]
             boxes = [b.to(self.device) for b in batch["boxes"]]
-
+            obj_mask = batch["obj_mask"].to(self.device, non_blocking=True) if "obj_mask" in batch else None
             logits = forward_mobile_sam(self.model, images, points, labels, boxes)
             loss = self.loss_fn(logits, masks)
             total_loss += float(loss.item()); n_batches += 1
-            m = compute_metrics(logits, masks, thr=0.5)
-            for k in agg: agg[k] += m[k]
+            m = compute_metrics(logits, masks, thr=0.5, obj_mask=obj_mask) if obj_mask is not None else compute_metrics(logits, masks, thr=0.5)
+            for k in agg:
+                if k in m:
+                    agg[k] += m[k]
         for k in agg: agg[k] /= max(1, n_batches)
-        return {"val_loss": total_loss / max(1, n_batches), "val_iou": agg["iou"], "val_f1": agg["f1"], "val_ber": agg["ber"]}
+        return {"val_loss": total_loss / max(1, n_batches), "val_iou": agg["iou"], "val_f1": agg["f1"], "val_ber": agg["ber"], "val_shadow_iou": agg["shadow_iou"]}
 
     def fit(self, ckpt_path: str) -> None:
         best_f1 = -1.0
+        ckpt_last = ckpt_path.replace('.pt', '_last.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_last.pt'
+        ckpt_best = ckpt_path.replace('.pt', '_best.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_best.pt'
         for epoch in tqdm(range(1, self.max_epochs + 1)):
             t0 = time.time()
             train_stats = self.train_epoch(epoch)
             val_stats = self.validate(epoch)
             self.scheduler.step()
 
-            print(f"[Epoch {epoch:03d}] "
-                  f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
-                  f"loss={train_stats['loss']:.4f} "
-                  f"val_loss={val_stats['val_loss']:.4f} "
-                  f"val_iou={val_stats['val_iou']:.4f} "
-                  f"val_f1={val_stats['val_f1']:.4f} "
-                  f"val_ber={val_stats['val_ber']:.4f} "
-                  f"time={(time.time()-t0):.1f}s")
-        
-            # if self.vis_dir and (epoch % self.vis_every == 0):
+
+        print(f"[Epoch {epoch:03d}] "
+            f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
+            f"loss={train_stats['loss']:.4f} "
+            f"val_loss={val_stats['val_loss']:.4f} "
+            f"val_iou={val_stats['val_iou']:.4f} "
+            f"val_f1={val_stats['val_f1']:.4f} "
+            f"val_ber={val_stats['val_ber']:.4f} "
+            f"val_shadow_iou={val_stats.get('val_shadow_iou', float('nan')):.4f} "
+            f"time={(time.time()-t0):.1f}s")
+
+        if self.wandb:
+            log_dict = {
+                "epoch": epoch,
+                "lr": self.optimizer.param_groups[0]["lr"],
+                "train/loss": train_stats["loss"],
+                "val/loss": val_stats["val_loss"],
+                "val/iou": val_stats["val_iou"],
+                "val/f1": val_stats["val_f1"],
+                "val/ber": val_stats["val_ber"],
+            }
+            if "val_shadow_iou" in val_stats:
+                log_dict["val/shadow_iou"] = val_stats["val_shadow_iou"]
+            self.wandb.log(log_dict, step=epoch)
+
             print(self.vis_dir, self.vis_every)
             self.save_predictions(epoch)
 
+            self.save_checkpoint(ckpt_last)
+
             if not math.isnan(val_stats["val_f1"]) and val_stats["val_f1"] > best_f1:
                 best_f1 = val_stats["val_f1"]
-                self.save_checkpoint(ckpt_path)
-                print(f"[Epoch {epoch:03d}] New best F1={best_f1:.4f}. Saved: {ckpt_path}")
+                self.save_checkpoint(ckpt_best)
+                print(f"[Epoch {epoch:03d}] New best F1={best_f1:.4f}. Saved: {ckpt_best}")
 
     def save_checkpoint(self, path: str) -> None:
         state = {
-            "image_encoder": self.model.image_encoder.state_dict(),
+            "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
         }
@@ -331,27 +355,30 @@ class Trainer:
 def build_dataloaders(
     images_dir: str,
     masks_dir: str,
+    object_masks_dir: str,
     size: int,
     batch_size: int,
     val_split: float,
     num_workers: int,
     seed: int
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
-    ds = SBUShadowDataset(
+    ds = ObjPromptShadowDataset(
         images_dir=images_dir,
-        masks_dir=masks_dir,
+        obj_masks_dir=object_masks_dir,
+        target_masks_dir=masks_dir,
         size=size,
         photometric_aug=True,
-        seed=seed
+        seed=seed,
+        return_obj_mask=True,
     )
     if val_split <= 0.0:
-        return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=sbu_collate), None
+        return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate), None
     val_len = int(len(ds) * val_split)
     train_len = len(ds) - val_len
     g = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(ds, [train_len, val_len], generator=g)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=sbu_collate)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=sbu_collate)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=two_mask_collate)
     return train_loader, val_loader
 
 
@@ -359,7 +386,6 @@ def build_dataloaders(
 def load_mobilesam_vit_t(ckpt_path: str | None, device: str = "cuda") -> nn.Module:
     model = sam_model_registry["vit_t"](checkpoint=ckpt_path)
     model.to(device)
-    # freeze decoders, train only image encoder
     for p in model.prompt_encoder.parameters():
         p.requires_grad = False
     for p in model.mask_decoder.parameters():
@@ -374,9 +400,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--images_dir", type=str, required=True)
     p.add_argument("--masks_dir", type=str, required=True)
+    p.add_argument("--obj_masks_dir", type=str, required=True)
     p.add_argument("--size", type=int, default=1024)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=5e-2)
     p.add_argument("--val_split", type=float, default=0.1)
@@ -385,27 +412,49 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--ckpt_out", type=str, default="mobilesam_shadow_best.pt")
-    p.add_argument("--pretrained", type=str, default="")  # optional MobileSAM checkpoint
+    p.add_argument("--pretrained", type=str, default="")
+    p.add_argument("--resume", type=str, default="")
     p.add_argument("--vis_dir", type=str, default="predictions")
     p.add_argument("--vis_every", type=int, default=1)
-    p.add_argument("--vis_num", type=int, default=8)
+    p.add_argument("--vis_num", type=int, default=50)
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default="mobilesam-shadow")
+    p.add_argument("--wandb_entity", type=str, default=None)
+    p.add_argument("--wandb_run", type=str, default=None)
+    p.add_argument("--wandb_mode", type=str, choices=["online", "offline", "disabled"], default="online")
+    p.add_argument("--wandb_images", type=int, default=16)
     return p.parse_args()
 
 
 def main() -> None:
+    load_dotenv()
     args = parse_args()
     set_seed(args.seed)
 
-    model = load_mobilesam_vit_t(args.pretrained, device=args.device)
+    model = load_mobilesam_vit_t(None, device=args.device)
     train_loader, val_loader = build_dataloaders(
         images_dir=args.images_dir,
         masks_dir=args.masks_dir,
+        object_masks_dir=args.obj_masks_dir,
         size=args.size,
         batch_size=args.batch_size,
         val_split=args.val_split,
         num_workers=args.num_workers,
         seed=args.seed
     )
+    first_batch = next(iter(train_loader))
+    print(f"[INFO] Train dataset size: {len(train_loader.dataset)} samples")
+    print(first_batch.keys())
+
+    wandb_run = None
+    if args.wandb:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run,
+            mode=args.wandb_mode,
+            config=vars(args),
+        )
 
     trainer = Trainer(
         model=model,
@@ -419,9 +468,53 @@ def main() -> None:
         device=args.device,
         vis_dir=args.vis_dir,
         vis_every=args.vis_every,
-        vis_num=10,
+        vis_num=args.vis_num,
+        wandb_run=wandb_run,
+        wandb_images=args.wandb_images,
     )
+
+    if args.resume:
+        print(f"[INFO] Loading checkpoint from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=args.device)
+        if isinstance(checkpoint, dict):
+            if "model" in checkpoint:
+                model.load_state_dict(checkpoint["model"])
+            elif all(isinstance(k, str) and k.startswith(("image_encoder.", "prompt_encoder.", "mask_decoder.")) for k in checkpoint.keys()):
+                model.load_state_dict(checkpoint)
+            elif all(k in checkpoint for k in ("image_encoder", "prompt_encoder", "mask_decoder")):
+                flat_state = {}
+                for submodule in ("image_encoder", "prompt_encoder", "mask_decoder"):
+                    subdict = checkpoint[submodule]
+                    for k, v in subdict.items():
+                        flat_state[f"{submodule}.{k}"] = v
+                model.load_state_dict(flat_state, strict=False)
+                print("[INFO] Załadowano checkpoint z podmodułów (image_encoder, prompt_encoder, mask_decoder)")
+            else:
+                print("[ERROR] Checkpoint nie zawiera klucza 'model' ani nie wygląda na state_dict modelu. Klucze:", list(checkpoint.keys()))
+                raise RuntimeError("Nieprawidłowy format checkpointu!")
+        else:
+            print("[ERROR] Checkpoint nie jest słownikiem!")
+            raise RuntimeError("Nieprawidłowy format checkpointu!")
+        try:
+            if isinstance(checkpoint, dict):
+                if "optimizer" in checkpoint:
+                    trainer.optimizer.load_state_dict(checkpoint["optimizer"])
+                if "scheduler" in checkpoint:
+                    trainer.scheduler.load_state_dict(checkpoint["scheduler"])
+                print("[INFO] Optimizer and scheduler state loaded.")
+        except Exception as e:
+            print(f"[WARN] Could not load optimizer/scheduler state: {e}")
+    elif args.pretrained:
+        print(f"[INFO] Loading pretrained weights from {args.pretrained}")
+        state = torch.load(args.pretrained, map_location=args.device)
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state, strict=False)
+
     trainer.fit(args.ckpt_out)
+
+    if wandb_run:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
