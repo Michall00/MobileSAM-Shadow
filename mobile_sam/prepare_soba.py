@@ -131,7 +131,6 @@ def resolve_pair_masks(
     obj_mask = np.zeros((h, w), dtype=np.uint8)
     sh_mask = np.zeros((h, w), dtype=np.uint8)
 
-    # Prefer per-annotation RLE; fallback to per-image mask PNGs if provided
     has_rle = any(a.rle for a in anns)
 
     if has_rle:
