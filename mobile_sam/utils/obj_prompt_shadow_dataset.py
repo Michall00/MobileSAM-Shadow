@@ -6,7 +6,10 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 import albumentations as A
+from pathlib import Path
 
+def _to_list(x: str | list[str]) -> list[str]:
+    return [x] if isinstance(x, str) else x
 
 def _to_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB")
@@ -109,9 +112,9 @@ class AugmentationConfig:
 class ObjPromptShadowDataset(Dataset):
     def __init__(
         self,
-        images_dir: str,
-        obj_masks_dir: str,
-        target_masks_dir: str,
+        images_dir: str | list[str],
+        obj_masks_dir: str | list[str],
+        target_masks_dir: str | list[str],
         size: int = 1024,
         pos_points_range: tuple[int,int] = (1,3),
         neg_points_range: tuple[int,int] = (1,3),
@@ -122,9 +125,9 @@ class ObjPromptShadowDataset(Dataset):
         return_obj_mask: bool = False,
         augmenter: Optional[A.Compose] = None
     ) -> None:
-        self.images_dir = images_dir
-        self.obj_masks_dir = obj_masks_dir
-        self.target_masks_dir = target_masks_dir
+        self.images_dir_list = [Path(p) for p in _to_list(images_dir)]
+        self.obj_masks_dir_list = [Path(p) for p in _to_list(obj_masks_dir)]
+        self.target_masks_dir_list = [Path(p) for p in _to_list(target_masks_dir)]
         self.size = size
         self.pos_range = pos_points_range
         self.neg_range = neg_points_range
@@ -135,25 +138,27 @@ class ObjPromptShadowDataset(Dataset):
         if seed is not None:
             random.seed(seed); np.random.seed(seed)
 
-        img_paths = sorted(glob.glob(os.path.join(images_dir, "**", "*.*"), recursive=True))
+        img_paths = sorted(p for img_dir in self.images_dir_list for p in img_dir.rglob("*.*"))
         valid_ext = {".jpg",".jpeg",".png",".bmp",".webp"}
         self.samples: list[tuple[str,str,str,str]] = []  # (img, obj_mask, tgt_mask, mode)
         print(f"Scanning {images_dir} for images...")
         print(f"Looking for object masks in {obj_masks_dir} and target masks in {target_masks_dir}...")
         print(f"Found {len(img_paths)} image files.")
 
-        for ip in img_paths:
-            ext = os.path.splitext(ip)[1].lower()
-            if ext not in valid_ext:
-                continue
-            base = os.path.splitext(os.path.basename(ip))[0]
-            obj_cands = [os.path.join(obj_masks_dir, base + ".png"), os.path.join(obj_masks_dir, base + ".jpg")]
-            tgt_cands = [os.path.join(target_masks_dir, base + ".png"), os.path.join(target_masks_dir, base + ".jpg")]
-            op = next((p for p in obj_cands if os.path.isfile(p)), None)
-            tp = next((p for p in tgt_cands if os.path.isfile(p)), None)
-            if op and tp:
-                # self.samples.append((ip, op, tp, "point"))
-                self.samples.append((ip, op, tp, "box"))
+        for img_dir, obj_dir, tgt_dir in zip(self.images_dir_list, self.obj_masks_dir_list, self.target_masks_dir_list):
+            img_paths = sorted(p for p in img_dir.rglob("*.*"))
+            for ip in img_paths:
+                ext = ip.suffix.lower()
+                if ext not in valid_ext:
+                    continue
+                base = ip.stem
+                obj_cands = [obj_dir / f"{base}.png", obj_dir / f"{base}.jpg"]
+                tgt_cands = [tgt_dir / f"{base}.png", tgt_dir / f"{base}.jpg"]
+                op = next((p for p in obj_cands if p.is_file()), None)
+                tp = next((p for p in tgt_cands if p.is_file()), None)
+                if op and tp:
+                    # self.samples.append((ip, op, tp, "point"))
+                    self.samples.append((str(ip), str(op), str(tp), "box"))
 
         if not self.samples:
             raise RuntimeError("No (image, object_mask, target_mask) triplets found.")
@@ -252,9 +257,18 @@ def main():
     )
 
     ds = ObjPromptShadowDataset(
-        images_dir="/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/images",
-        obj_masks_dir="/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/object_masks",
-        target_masks_dir="/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/masks",
+        images_dir=[
+            "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/images",
+            "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/images_aug/flip",
+        ],
+        obj_masks_dir=[
+            "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/object_masks",
+            "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/object_masks_aug/flip",
+        ],
+        target_masks_dir=[
+            "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/masks",
+            "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/masks_aug/flip",
+        ],
         size=1024,
         box_from="object",
         seed=42,
