@@ -9,10 +9,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from typing import Any
 import wandb
 from dotenv import load_dotenv
+import torch
+import torch.nn.functional as F
+from typing import List
 
 # from mobile_sam.utils.sbu_dataset import SBUShadowDataset, sbu_collate
 from mobile_sam.utils.obj_prompt_shadow_dataset import ObjPromptShadowDataset, two_mask_collate
@@ -77,10 +80,6 @@ def freeze_non_encoder(model: nn.Module) -> List[nn.Parameter]:
         p.requires_grad = True
     return enc_params
 
-
-import torch
-import torch.nn.functional as F
-from typing import List
 
 
 @torch.enable_grad()
@@ -220,26 +219,30 @@ class Trainer:
                 boxes = [b.to(self.device) for b in batch["boxes"]]
 
                 logits = forward_mobile_sam(self.model, images, points, labels, boxes)
-                probs = torch.sigmoid(logits)
+                preds = torch.sigmoid(logits) >= 0.5
 
-                B = images.size(0)
-                for i in range(B):
+                for i in range(images.size(0)):
                     img_np = sam_denormalize(images[i])
-                    gt = (masks[i, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
-                    pr = (probs[i, 0].detach().cpu().numpy() >= 0.5).astype(np.uint8)
+                    gt_np = masks[i, 0].cpu().numpy() > 0.5
+                    pred_np = preds[i, 0].cpu().numpy() > 0.5
 
-                    pts = points[i].detach().cpu().numpy() if points[i].numel() > 0 else np.zeros((0,2))
-                    panel = make_panel_with_points(img_np, gt, pr, pts)
+                    # Include bounding boxes in the panel
+                    box = boxes[i]
+                    if box.numel() == 4:
+                        x0, y0, x1, y1 = box.cpu().numpy()
+                        panel = make_panel_with_points(img_np, gt_np, pred_np, points[i].cpu().numpy())
+                        draw = ImageDraw.Draw(panel)
+                        draw.rectangle([x0, y0, x1, y1], outline="blue", width=2)
+                    else:
+                        panel = make_panel_with_points(img_np, gt_np, pred_np, points[i].cpu().numpy())
 
-                    out_path = os.path.join(out_dir, f"b{b_idx:05d}_i{i:02d}.png")
-                    panel.save(out_path)
+                    # panel_path = os.path.join(out_dir, f"{saved:03d}.png")
+                    # panel.save(panel_path)
+
+                    if self.wandb and saved < self.wandb_images:
+                        wb_imgs.append(wandb.Image(panel, caption=f"Sample {saved}"))
+
                     saved += 1
-
-                    if self.wandb and (self.wandb_images < 0 or len(wb_imgs) < self.wandb_images):
-                        wb_imgs.append(wandb.Image(panel, caption=f"epoch_{epoch:03d}_b{b_idx:05d}_i{i:02d}"))
-
-                if self.vis_num >= 0 and saved >= self.vis_num:
-                    break
 
         if self.wandb and wb_imgs:
             self.wandb.log({"predictions": wb_imgs}, step=epoch)
@@ -309,39 +312,39 @@ class Trainer:
             self.scheduler.step()
 
 
-        print(f"[Epoch {epoch:03d}] "
-            f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
-            f"loss={train_stats['loss']:.4f} "
-            f"val_loss={val_stats['val_loss']:.4f} "
-            f"val_iou={val_stats['val_iou']:.4f} "
-            f"val_f1={val_stats['val_f1']:.4f} "
-            f"val_ber={val_stats['val_ber']:.4f} "
-            f"val_shadow_iou={val_stats.get('val_shadow_iou', float('nan')):.4f} "
-            f"time={(time.time()-t0):.1f}s")
+            print(f"[Epoch {epoch:03d}] "
+                f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
+                f"loss={train_stats['loss']:.4f} "
+                f"val_loss={val_stats['val_loss']:.4f} "
+                f"val_iou={val_stats['val_iou']:.4f} "
+                f"val_f1={val_stats['val_f1']:.4f} "
+                f"val_ber={val_stats['val_ber']:.4f} "
+                f"val_shadow_iou={val_stats.get('val_shadow_iou', float('nan')):.4f} "
+                f"time={(time.time()-t0):.1f}s")
 
-        if self.wandb:
-            log_dict = {
-                "epoch": epoch,
-                "lr": self.optimizer.param_groups[0]["lr"],
-                "train/loss": train_stats["loss"],
-                "val/loss": val_stats["val_loss"],
-                "val/iou": val_stats["val_iou"],
-                "val/f1": val_stats["val_f1"],
-                "val/ber": val_stats["val_ber"],
-            }
-            if "val_shadow_iou" in val_stats:
-                log_dict["val/shadow_iou"] = val_stats["val_shadow_iou"]
-            self.wandb.log(log_dict, step=epoch)
+            if self.wandb:
+                log_dict = {
+                    "epoch": epoch,
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "train/loss": train_stats["loss"],
+                    "val/loss": val_stats["val_loss"],
+                    "val/iou": val_stats["val_iou"],
+                    "val/f1": val_stats["val_f1"],
+                    "val/ber": val_stats["val_ber"],
+                }
+                if "val_shadow_iou" in val_stats:
+                    log_dict["val/shadow_iou"] = val_stats["val_shadow_iou"]
+                self.wandb.log(log_dict, step=epoch)
 
-            print(self.vis_dir, self.vis_every)
-            self.save_predictions(epoch)
+                print(self.vis_dir, self.vis_every)
+                self.save_predictions(epoch)
 
-            self.save_checkpoint(ckpt_last)
+                self.save_checkpoint(ckpt_last)
 
-            if not math.isnan(val_stats["val_f1"]) and val_stats["val_f1"] > best_f1:
-                best_f1 = val_stats["val_f1"]
-                self.save_checkpoint(ckpt_best)
-                print(f"[Epoch {epoch:03d}] New best F1={best_f1:.4f}. Saved: {ckpt_best}")
+                if not math.isnan(val_stats["val_f1"]) and val_stats["val_f1"] > best_f1:
+                    best_f1 = val_stats["val_f1"]
+                    self.save_checkpoint(ckpt_best)
+                    print(f"[Epoch {epoch:03d}] New best F1={best_f1:.4f}. Saved: {ckpt_best}")
 
     def save_checkpoint(self, path: str) -> None:
         state = {
@@ -398,12 +401,12 @@ def load_mobilesam_vit_t(ckpt_path: str | None, device: str = "cuda") -> nn.Modu
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--images_dir", type=str, required=True)
-    p.add_argument("--masks_dir", type=str, required=True)
-    p.add_argument("--obj_masks_dir", type=str, required=True)
+    p.add_argument("--images_dir", type=str)
+    p.add_argument("--masks_dir", type=str)
+    p.add_argument("--obj_masks_dir", type=str)
     p.add_argument("--size", type=int, default=1024)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=5e-2)
     p.add_argument("--val_split", type=float, default=0.1)
@@ -411,13 +414,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--amp", action="store_true")
-    p.add_argument("--ckpt_out", type=str, default="mobilesam_shadow_best.pt")
-    p.add_argument("--pretrained", type=str, default="")
+    p.add_argument("--ckpt_out", type=str, default="mobilesam_aug_best.pt")
+    p.add_argument("--pretrained", type=str, default="/home/msadowski/Studia/Inzynierka/MobileSAM/weights/mobile_sam.pt")
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--vis_dir", type=str, default="predictions")
     p.add_argument("--vis_every", type=int, default=1)
     p.add_argument("--vis_num", type=int, default=50)
-    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb", action="store_true", default=True)
     p.add_argument("--wandb_project", type=str, default="mobilesam-shadow")
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_run", type=str, default=None)
@@ -431,90 +434,112 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    model = load_mobilesam_vit_t(None, device=args.device)
-    train_loader, val_loader = build_dataloaders(
-        images_dir=args.images_dir,
-        masks_dir=args.masks_dir,
-        object_masks_dir=args.obj_masks_dir,
-        size=args.size,
-        batch_size=args.batch_size,
-        val_split=args.val_split,
-        num_workers=args.num_workers,
-        seed=args.seed
-    )
-    first_batch = next(iter(train_loader))
-    print(f"[INFO] Train dataset size: {len(train_loader.dataset)} samples")
-    print(first_batch.keys())
+    base_images_dir = "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/images_test"
+    base_obj_masks_dir = "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/object_masks_test"
+    base_tgt_masks_dir = "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/masks_test"
 
-    wandb_run = None
-    if args.wandb:
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_run,
-            mode=args.wandb_mode,
-            config=vars(args),
+    augmentations = [
+        ("flip", "flip"),
+        ("blur", "blur"),
+        ("rotate", "rotate"),
+        ("hue", "hue"),
+        ("bright", "bright"),
+    ]
+
+    for aug_name, aug_folder in augmentations:
+        print(f"\n[INFO] Training: base + {aug_name}")
+
+        images_dir = [base_images_dir, f"{base_images_dir}_aug/{aug_folder}"]
+        obj_masks_dir = [base_obj_masks_dir, f"{base_obj_masks_dir}_aug/{aug_folder}"]
+        target_masks_dir = [base_tgt_masks_dir, f"{base_tgt_masks_dir}_aug/{aug_folder}"]
+
+        model = load_mobilesam_vit_t(None, device=args.device)
+        train_loader, val_loader = build_dataloaders(
+            images_dir=images_dir,
+            masks_dir=target_masks_dir,
+            object_masks_dir=obj_masks_dir,
+            size=args.size,
+            batch_size=args.batch_size,
+            val_split=args.val_split,
+            num_workers=args.num_workers,
+            seed=args.seed
+        )
+        first_batch = next(iter(train_loader))
+        print(f"[INFO] Train dataset size: {len(train_loader.dataset)} samples")
+        print(first_batch.keys())
+
+        wandb_run = None
+        if args.wandb:
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run,
+                mode=args.wandb_mode,
+                config={
+                    **vars(args),
+                    "augmentation": aug_name,
+                }
+            )
+
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            max_epochs=args.epochs,
+            grad_clip=1.0,
+            amp=args.amp,
+            device=args.device,
+            vis_dir=args.vis_dir,
+            vis_every=args.vis_every,
+            vis_num=args.vis_num,
+            wandb_run=wandb_run,
+            wandb_images=args.wandb_images,
         )
 
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        max_epochs=args.epochs,
-        grad_clip=1.0,
-        amp=args.amp,
-        device=args.device,
-        vis_dir=args.vis_dir,
-        vis_every=args.vis_every,
-        vis_num=args.vis_num,
-        wandb_run=wandb_run,
-        wandb_images=args.wandb_images,
-    )
-
-    if args.resume:
-        print(f"[INFO] Loading checkpoint from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=args.device)
-        if isinstance(checkpoint, dict):
-            if "model" in checkpoint:
-                model.load_state_dict(checkpoint["model"])
-            elif all(isinstance(k, str) and k.startswith(("image_encoder.", "prompt_encoder.", "mask_decoder.")) for k in checkpoint.keys()):
-                model.load_state_dict(checkpoint)
-            elif all(k in checkpoint for k in ("image_encoder", "prompt_encoder", "mask_decoder")):
-                flat_state = {}
-                for submodule in ("image_encoder", "prompt_encoder", "mask_decoder"):
-                    subdict = checkpoint[submodule]
-                    for k, v in subdict.items():
-                        flat_state[f"{submodule}.{k}"] = v
-                model.load_state_dict(flat_state, strict=False)
-                print("[INFO] Załadowano checkpoint z podmodułów (image_encoder, prompt_encoder, mask_decoder)")
-            else:
-                print("[ERROR] Checkpoint nie zawiera klucza 'model' ani nie wygląda na state_dict modelu. Klucze:", list(checkpoint.keys()))
-                raise RuntimeError("Nieprawidłowy format checkpointu!")
-        else:
-            print("[ERROR] Checkpoint nie jest słownikiem!")
-            raise RuntimeError("Nieprawidłowy format checkpointu!")
-        try:
+        if args.resume:
+            print(f"[INFO] Loading checkpoint from {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=args.device)
             if isinstance(checkpoint, dict):
-                if "optimizer" in checkpoint:
-                    trainer.optimizer.load_state_dict(checkpoint["optimizer"])
-                if "scheduler" in checkpoint:
-                    trainer.scheduler.load_state_dict(checkpoint["scheduler"])
-                print("[INFO] Optimizer and scheduler state loaded.")
-        except Exception as e:
-            print(f"[WARN] Could not load optimizer/scheduler state: {e}")
-    elif args.pretrained:
-        print(f"[INFO] Loading pretrained weights from {args.pretrained}")
-        state = torch.load(args.pretrained, map_location=args.device)
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        model.load_state_dict(state, strict=False)
+                if "model" in checkpoint:
+                    model.load_state_dict(checkpoint["model"])
+                elif all(isinstance(k, str) and k.startswith(("image_encoder.", "prompt_encoder.", "mask_decoder.")) for k in checkpoint.keys()):
+                    model.load_state_dict(checkpoint)
+                elif all(k in checkpoint for k in ("image_encoder", "prompt_encoder", "mask_decoder")):
+                    flat_state = {}
+                    for submodule in ("image_encoder", "prompt_encoder", "mask_decoder"):
+                        subdict = checkpoint[submodule]
+                        for k, v in subdict.items():
+                            flat_state[f"{submodule}.{k}"] = v
+                    model.load_state_dict(flat_state, strict=False)
+                    print("[INFO] Loaded checkpoint (image_encoder, prompt_encoder, mask_decoder)")
+                else:
+                    print("[ERROR] Checkpoint does not contain 'model' key or does not look like a model state_dict. Keys:", list(checkpoint.keys()))
+                    raise RuntimeError("Invalid checkpoint format!")
+            else:
+                print("[ERROR] Checkpoint is not a dictionary!")
+                raise RuntimeError("Invalid checkpoint format!")
+            try:
+                if isinstance(checkpoint, dict):
+                    if "optimizer" in checkpoint:
+                        trainer.optimizer.load_state_dict(checkpoint["optimizer"])
+                    if "scheduler" in checkpoint:
+                        trainer.scheduler.load_state_dict(checkpoint["scheduler"])
+                    print("[INFO] Optimizer and scheduler state loaded.")
+            except Exception as e:
+                print(f"[WARN] Could not load optimizer/scheduler state: {e}")
+        elif args.pretrained:
+            print(f"[INFO] Loading pretrained weights from {args.pretrained}")
+            state = torch.load(args.pretrained, map_location=args.device)
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            model.load_state_dict(state, strict=False)
 
-    trainer.fit(args.ckpt_out)
+        trainer.fit(args.ckpt_out)
 
-    if wandb_run:
-        wandb_run.finish()
+        if wandb_run:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
