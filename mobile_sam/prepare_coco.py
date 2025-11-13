@@ -62,7 +62,7 @@ def main():
 
     saved = 0
     trials = 0
-    max_trials = args.n * 20
+    max_trials = args.n * 2000
     with open(meta_path, "w", encoding="utf-8") as fh:
         while saved < args.n and trials < max_trials:
             trials += 1
@@ -78,13 +78,15 @@ def main():
             except Exception as e:
                 logging.warning(f"Failed to extract instance: {e}. img_info: {img_info}")
                 continue
-            # Filtrowanie po kategorii
+
             if args.allowed_category_ids is not None and cat_id not in args.allowed_category_ids:
+                logging.error(f"Category ID {cat_id} is not allowed.")
                 continue
-            # Filtrowanie po powierzchni maski
+
             mask_np = np.array(obj_mask)
             mask_area = np.sum(mask_np > 0)
             if mask_area < args.min_mask_area:
+                logging.error(f"Mask area is too small. {mask_area} < {args.min_mask_area}")
                 continue
             if not bg_paths:
                 logging.error("No background images found.")
@@ -95,7 +97,7 @@ def main():
             except Exception as e:
                 logging.warning(f"Failed to open background image {bg_path}: {e}")
                 continue
-            # Resize wszystko do 1024x1024
+
             target_size = (1024, 1024)
             obj_img = obj_img.resize(target_size, Image.BICUBIC)
             obj_mask = obj_mask.resize(target_size, Image.NEAREST)
