@@ -1,0 +1,49 @@
+defaults:
+  - _self_
+
+system:
+  device: "cpu"
+  seed: 42
+  num_workers: 1
+
+data:
+  root_dir: "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba"
+  images_dir: "${data.root_dir}/images_test"
+  masks_dir: "${data.root_dir}/masks_test"
+  obj_masks_dir: "${data.root_dir}/object_masks_test"
+  size: 1024
+  batch_size: 1
+
+model:
+  type: "vit_t"
+  pretrained_path: "/home/msadowski/Studia/Inzynierka/MobileSAM/weights/mobile_sam.pt"
+  pruning:
+    enabled: true
+    mode: "layer_ln_structured"
+    amount: 0.2
+
+wandb:
+  enabled: true
+  project: "mobilesam-shadow"
+  entity: null
+  mode: "online"
+  run_name: ""
+  wandb_images_num: 4
+
+train:
+  epochs: 1
+  lr: 1e-4
+  weight_decay: 5e-2
+  grad_clip: 1.0
+  amp: true
+  val_split: 0.1
+  resume_ckpt: "" 
+  output_ckpt: "mobilesam_aug_best.pt"
+  vis_every: 1
+
+test:
+  ckpt_path: null
+  vis_dir: "predictions_val_shadow"
+  vis_num: 50
+  vis_every: 1
+  save_csv: "test_metrics.csv"

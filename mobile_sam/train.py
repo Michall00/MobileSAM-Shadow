@@ -2,7 +2,6 @@ from typing import Dict, List, Optional, Tuple
 import os
 import math
 import time
-import argparse
 import random
 import torch
 import torch.nn as nn
@@ -17,10 +16,15 @@ import torch
 import torch.nn.functional as F
 from typing import List
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
 # from mobile_sam.utils.sbu_dataset import SBUShadowDataset, sbu_collate
 from mobile_sam.utils.obj_prompt_shadow_dataset import ObjPromptShadowDataset, two_mask_collate
 from mobile_sam.build_sam import sam_model_registry
 from mobile_sam.utils.common import sam_denormalize, color_overlay, make_panel, make_panel_with_points
+
+from mobile_sam.prune import apply_pruning, remove_pruning_reparam
 
 
 class ShadowLoss(nn.Module):
@@ -253,9 +257,11 @@ class Trainer:
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
         total_loss, n_batches = 0.0, 0
+        agg = {"iou": 0.0, "f1": 0.0, "ber": 0.0, "shadow_iou": 0.0}
         for batch in tqdm(self.train_loader):
             images = batch["image"].to(self.device, non_blocking=True)
             masks = batch["mask"].to(self.device, non_blocking=True)
+            obj_mask = batch["obj_mask"].to(self.device, non_blocking=True) if "obj_mask" in batch else None
             points = [p.to(self.device) for p in batch["points"]]
             labels = [l.to(self.device) for l in batch["point_labels"]]
             boxes = [b.to(self.device) for b in batch["boxes"]]
@@ -274,8 +280,13 @@ class Trainer:
 
             total_loss += float(loss.item())
             n_batches += 1
+            m = compute_metrics(logits, masks, thr=0.5, obj_mask=obj_mask) if obj_mask is not None else compute_metrics(logits, masks, thr=0.5)
+            for k in agg:
+                if k in m:
+                    agg[k] += m[k]
 
-        return {"loss": total_loss / max(1, n_batches)}
+        for k in agg: agg[k] /= max(1, n_batches)
+        return {"train_loss": total_loss / max(1, n_batches), "train_iou": agg["iou"], "train_f1": agg["f1"], "train_ber": agg["ber"], "train_shadow_iou": agg["shadow_iou"]}
 
     @torch.no_grad()
     def validate(self, epoch: int) -> Dict[str, float]:
@@ -314,7 +325,11 @@ class Trainer:
 
             print(f"[Epoch {epoch:03d}] "
                 f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
-                f"loss={train_stats['loss']:.4f} "
+                f"train_loss={train_stats['train_loss']:.4f} "
+                f"train_iou={train_stats['train_iou']:.4f} "
+                f"train_f1={train_stats['train_f1']:.4f} "
+                f"train_ber={train_stats['train_ber']:.4f} "
+                f"train_shadow_iou={train_stats['train_shadow_iou']:.4f} "
                 f"val_loss={val_stats['val_loss']:.4f} "
                 f"val_iou={val_stats['val_iou']:.4f} "
                 f"val_f1={val_stats['val_f1']:.4f} "
@@ -326,13 +341,17 @@ class Trainer:
                 log_dict = {
                     "epoch": epoch,
                     "lr": self.optimizer.param_groups[0]["lr"],
-                    "train/loss": train_stats["loss"],
+                    "train/loss": train_stats["train_loss"],
+                    "train/iou": train_stats["train_iou"],
+                    "train/f1": train_stats["train_f1"],
+                    "train/ber": train_stats["train_ber"],
                     "val/loss": val_stats["val_loss"],
                     "val/iou": val_stats["val_iou"],
                     "val/f1": val_stats["val_f1"],
                     "val/ber": val_stats["val_ber"],
                 }
                 if "val_shadow_iou" in val_stats:
+                    log_dict["train/shadow_iou"] = train_stats["train_shadow_iou"]
                     log_dict["val/shadow_iou"] = val_stats["val_shadow_iou"]
                 self.wandb.log(log_dict, step=epoch)
 
@@ -370,7 +389,6 @@ def build_dataloaders(
         obj_masks_dir=object_masks_dir,
         target_masks_dir=masks_dir,
         size=size,
-        photometric_aug=True,
         seed=seed,
         return_obj_mask=True,
     )
@@ -399,51 +417,21 @@ def load_mobilesam_vit_t(ckpt_path: str | None, device: str = "cuda") -> nn.Modu
     return model
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--images_dir", type=str)
-    p.add_argument("--masks_dir", type=str)
-    p.add_argument("--obj_masks_dir", type=str)
-    p.add_argument("--size", type=int, default=1024)
-    p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=5e-2)
-    p.add_argument("--val_split", type=float, default=0.1)
-    p.add_argument("--num_workers", type=int, default=1)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--amp", action="store_true")
-    p.add_argument("--ckpt_out", type=str, default="mobilesam_aug_best.pt")
-    p.add_argument("--pretrained", type=str, default="/home/msadowski/Studia/Inzynierka/MobileSAM/weights/mobile_sam.pt")
-    p.add_argument("--resume", type=str, default="")
-    p.add_argument("--vis_dir", type=str, default="predictions")
-    p.add_argument("--vis_every", type=int, default=1)
-    p.add_argument("--vis_num", type=int, default=50)
-    p.add_argument("--wandb", action="store_true", default=True)
-    p.add_argument("--wandb_project", type=str, default="mobilesam-shadow")
-    p.add_argument("--wandb_entity", type=str, default=None)
-    p.add_argument("--wandb_run", type=str, default=None)
-    p.add_argument("--wandb_mode", type=str, choices=["online", "offline", "disabled"], default="online")
-    p.add_argument("--wandb_images", type=int, default=16)
-    return p.parse_args()
-
-
-def main() -> None:
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: DictConfig) -> None:
     load_dotenv()
-    args = parse_args()
-    set_seed(args.seed)
+    set_seed(cfg.system.seed)
 
-    base_images_dir = "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/images_test"
-    base_obj_masks_dir = "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/object_masks_test"
-    base_tgt_masks_dir = "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba/masks_test"
+    base_images_dir = cfg.data.images_dir
+    base_obj_masks_dir = cfg.data.obj_masks_dir
+    base_tgt_masks_dir = cfg.data.masks_dir
 
     augmentations = [
         ("flip", "flip"),
-        ("blur", "blur"),
-        ("rotate", "rotate"),
-        ("hue", "hue"),
-        ("bright", "bright"),
+        # ("blur", "blur"),
+        # ("rotate", "rotate"),
+        # ("hue", "hue"),
+        # ("bright", "bright"),
     ]
 
     for aug_name, aug_folder in augmentations:
@@ -453,54 +441,57 @@ def main() -> None:
         obj_masks_dir = [base_obj_masks_dir, f"{base_obj_masks_dir}_aug/{aug_folder}"]
         target_masks_dir = [base_tgt_masks_dir, f"{base_tgt_masks_dir}_aug/{aug_folder}"]
 
-        model = load_mobilesam_vit_t(None, device=args.device)
+        model = load_mobilesam_vit_t(None, device=cfg.system.device)
         train_loader, val_loader = build_dataloaders(
             images_dir=images_dir,
             masks_dir=target_masks_dir,
             object_masks_dir=obj_masks_dir,
-            size=args.size,
-            batch_size=args.batch_size,
-            val_split=args.val_split,
-            num_workers=args.num_workers,
-            seed=args.seed
+            size=cfg.data.size,
+            batch_size=cfg.data.batch_size,
+            val_split=cfg.train.val_split,
+            num_workers=cfg.system.num_workers,
+            seed=cfg.system.seed
         )
         first_batch = next(iter(train_loader))
         print(f"[INFO] Train dataset size: {len(train_loader.dataset)} samples")
         print(first_batch.keys())
 
         wandb_run = None
-        if args.wandb:
+        if cfg.wandb.enabled:
+            config_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+
+            config_dict["current_augmentation"] = aug_name
+
+            config_dict["pruning_type"] = cfg.model.pruning.mode
+            config_dict["pruning_amount"] = cfg.model.pruning.amount
+
             wandb_run = wandb.init(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                name=args.wandb_run,
-                mode=args.wandb_mode,
-                config={
-                    **vars(args),
-                    "augmentation": aug_name,
-                }
+                project=cfg.wandb.project,
+                entity=cfg.wandb.entity,
+                mode=cfg.wandb.mode,
+                config=config_dict
             )
 
         trainer = Trainer(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            max_epochs=args.epochs,
+            lr=cfg.train.lr,
+            weight_decay=cfg.train.weight_decay,
+            max_epochs=cfg.train.epochs,
             grad_clip=1.0,
-            amp=args.amp,
-            device=args.device,
-            vis_dir=args.vis_dir,
-            vis_every=args.vis_every,
-            vis_num=args.vis_num,
+            amp=cfg.train.amp,
+            device=cfg.system.device,
+            vis_dir=cfg.test.vis_dir,
+            vis_every=cfg.test.vis_every,
+            vis_num=cfg.test.vis_num,
             wandb_run=wandb_run,
-            wandb_images=args.wandb_images,
+            wandb_images=cfg.wandb.wandb_images_num,
         )
 
-        if args.resume:
-            print(f"[INFO] Loading checkpoint from {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=args.device)
+        if cfg.train.resume_ckpt:
+            print(f"[INFO] Loading checkpoint from {cfg.train.resume_ckpt}")
+            checkpoint = torch.load(cfg.train.resume_ckpt, map_location=cfg.system.device)
             if isinstance(checkpoint, dict):
                 if "model" in checkpoint:
                     model.load_state_dict(checkpoint["model"])
@@ -529,14 +520,37 @@ def main() -> None:
                     print("[INFO] Optimizer and scheduler state loaded.")
             except Exception as e:
                 print(f"[WARN] Could not load optimizer/scheduler state: {e}")
-        elif args.pretrained:
-            print(f"[INFO] Loading pretrained weights from {args.pretrained}")
-            state = torch.load(args.pretrained, map_location=args.device)
+        elif cfg.model.pretrained_path:
+            print(f"[INFO] Loading pretrained weights from {cfg.model.pretrained_path}")
+            state = torch.load(cfg.model.pretrained_path, map_location=cfg.system.device)
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
             model.load_state_dict(state, strict=False)
 
-        trainer.fit(args.ckpt_out)
+        if cfg.model.pruning.enabled:
+            print(f"[INFO] Pruning ENABLED. Mode: {cfg.model.pruning.mode}, Amount: {cfg.model.pruning.amount}")
+            apply_pruning(
+                model=trainer.model,
+                mode=cfg.model.pruning.mode,
+                amount=cfg.model.pruning.amount,
+                include_linear=True,
+                structured_n=1,
+                structured_dim=0,
+            )
+        else:
+            print("[INFO] Pruning DISABLED.")
+
+        trainer.fit(cfg.train.output_ckpt)
+
+        if cfg.model.pruning.enabled:
+            remove_pruning_reparam(trainer.model)
+            suffix = "_pruned"
+        else:
+            suffix = ""
+
+        ckpt_final = cfg.train.output_ckpt.replace('.pt', f'_{aug_name}_final{suffix}.pt') if cfg.train.output_ckpt.endswith('.pt') else cfg.train.output_ckpt + f'_{aug_name}_final{suffix}.pt'
+        torch.save(trainer.model.state_dict(), ckpt_final)
+        print(f"[INFO] Saved final pruned model to {ckpt_final}")
 
         if wandb_run:
             wandb_run.finish()
