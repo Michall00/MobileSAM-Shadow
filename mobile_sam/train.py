@@ -1,34 +1,34 @@
-from typing import Dict, List, Optional, Tuple
-import os
 import math
-import time
+import os
 import random
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
-import numpy as np
-from PIL import Image, ImageDraw
-from typing import Any
-import wandb
-from dotenv import load_dotenv
-import torch
-import torch.nn.functional as F
-from typing import List
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import albumentations as A
 import hydra
+import numpy as np
+import torch
+import torch.nn as nn
+import wandb
+from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
+from PIL import Image, ImageDraw
+from rich.logging import RichHandler
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-# from mobile_sam.utils.sbu_dataset import SBUShadowDataset, sbu_collate
-from mobile_sam.utils.obj_prompt_shadow_dataset import ObjPromptShadowDataset, two_mask_collate
 from mobile_sam.build_sam import sam_model_registry
-from mobile_sam.utils.common import sam_denormalize, color_overlay, make_panel, make_panel_with_points
-
 from mobile_sam.prune import apply_pruning, remove_pruning_reparam
-from mobile_sam.utils.obj_prompt_shadow_dataset import AugmentationConfig
+# from mobile_sam.utils.sbu_dataset import SBUShadowDataset, sbu_collate
+from mobile_sam.utils.common import make_panel_with_points, sam_denormalize
+from mobile_sam.utils.eval import compute_metrics, forward_mobile_sam
+from mobile_sam.utils.obj_prompt_shadow_dataset import (
+    AugmentationConfig,
+    ObjPromptShadowDataset,
+    two_mask_collate,
+)
 
 import logging
-from rich.logging import RichHandler
 
 
 logging.basicConfig(
@@ -63,30 +63,6 @@ class ShadowLoss(nn.Module):
         return self.bce(logits, target) + self.dice(logits, target)
 
 
-@torch.no_grad()
-def compute_metrics(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5, obj_mask: torch.Tensor = None) -> Dict[str, float]:
-    probs = torch.sigmoid(logits)
-    pred = (probs >= thr).float()
-    tp = (pred * target).sum().item()
-    tn = ((1 - pred) * (1 - target)).sum().item()
-    fp = (pred * (1 - target)).sum().item()
-    fn = ((1 - pred) * target).sum().item()
-    iou = tp / max(1.0, (tp + fp + fn))
-    prec = tp / max(1.0, (tp + fp))
-    rec = tp / max(1.0, (tp + fn))
-    f1 = 2 * prec * rec / max(1e-6, (prec + rec))
-    ber = 0.5 * (fn / max(1.0, tp + fn) + fp / max(1.0, tn + fp))
-    metrics = {"iou": iou, "f1": f1, "ber": ber}
-    if obj_mask is not None:
-        shadow_pred = (pred - obj_mask).clamp(min=0)
-        shadow_gt = (target - obj_mask).clamp(min=0)
-        intersection = (shadow_pred * shadow_gt).sum().item()
-        union = ((shadow_pred + shadow_gt) > 0).float().sum().item()
-        shadow_iou = intersection / max(1.0, union)
-        metrics["shadow_iou"] = shadow_iou
-    return metrics
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -102,82 +78,6 @@ def freeze_non_encoder(model: nn.Module) -> List[nn.Parameter]:
     for p in enc_params:
         p.requires_grad = True
     return enc_params
-
-
-
-@torch.enable_grad()
-def forward_mobile_sam(
-    model: torch.nn.Module,
-    images: torch.Tensor,                   # [B,3,H,W], already SAM-normalized and 1024x1024
-    points: List[torch.Tensor],             # list of [Ni,2] int32 per-sample in 1024 grid
-    point_labels: List[torch.Tensor],       # list of [Ni]   int32 per-sample (1=pos,0=neg)
-    boxes: List[torch.Tensor],              # list of [4] xyxy int32 or empty tensor
-    multimask_output: bool = False
-) -> torch.Tensor:
-    """
-    Direct call to MobileSAM submodules:
-      image_encoder -> prompt_encoder -> mask_decoder -> upsample to HxW.
-    Returns logits of shape [B,1,H,W].
-    """
-    device = images.device
-    B, _, H, W = images.shape
-    assert H == 1024 and W == 1024, "Expected 1024x1024 inputs (match your dataset)."
-
-    # 1) Encode image
-    image_embeddings = model.image_encoder(images)  # [B,256,64,64] typically
-
-    # 2) Positional enc. from prompt encoder (buffer moved with model.to(device))
-    image_pe = model.prompt_encoder.get_dense_pe()  # [1,256,64,64]
-
-    logits_out: List[torch.Tensor] = []
-
-    for i in range(B):
-        # Prepare prompts for sample i
-        pts_i = points[i]
-        lbs_i = point_labels[i]
-        box_i = boxes[i]
-
-        # None if empty
-        pts_tuple = None
-        if pts_i.numel() > 0:
-            # PromptEncoder expects float coords and int labels with batch dim
-            coords = pts_i.to(device=device, dtype=torch.float32).unsqueeze(0)       # [1,Ni,2]
-            labels = lbs_i.to(device=device, dtype=torch.int64).unsqueeze(0)         # [1,Ni]
-            pts_tuple = (coords, labels)
-
-        box_tensor = None
-        if box_i.numel() == 4:
-            box_tensor = box_i.to(device=device, dtype=torch.float32).unsqueeze(0)   # [1,4]
-
-        # 3) Encode prompts
-        sparse_embeds, dense_embeds = model.prompt_encoder(
-            points=pts_tuple,
-            boxes=box_tensor,
-            masks=None
-        )  # sparse: [1,Np,256], dense: [1,256,64,64]
-
-        # 4) Decode mask(s)
-        lowres_logits, iou_pred = model.mask_decoder(
-            image_embeddings=image_embeddings[i:i+1],     # [1,256,64,64]
-            image_pe=image_pe,                             # [1,256,64,64]
-            sparse_prompt_embeddings=sparse_embeds,        # [1,Np,256]
-            dense_prompt_embeddings=dense_embeds,          # [1,256,64,64]
-            multimask_output=multimask_output
-        )  # -> [1,K,256,256], [1,K] where K=1 if multimask_output=False else 3
-
-        # 5) Choose one mask (if multimask_output=True pick best by IoU)
-        if lowres_logits.shape[1] > 1:
-            best_idx = torch.argmax(iou_pred, dim=1)      # [1]
-            chosen = lowres_logits[torch.arange(1, device=device), best_idx]  # [1,256,256]
-        else:
-            chosen = lowres_logits[:, 0]                   # [1,256,256]
-
-        # 6) Upsample to input size
-        chosen = F.interpolate(chosen.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False)  # [1,1,1024,1024]
-        logits_out.append(chosen)
-
-    return torch.cat(logits_out, dim=0)  # [B,1,1024,1024]
-
 
 
 class Trainer:

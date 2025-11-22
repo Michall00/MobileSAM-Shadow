@@ -1,27 +1,25 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
 import os
 import csv
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import numpy as np
-from PIL import ImageDraw
-import wandb
-from dotenv import load_dotenv
+import logging
+from typing import Any, Dict, List, Optional
 
 import hydra
-from omegaconf import OmegaConf, DictConfig
+import numpy as np
+import torch
+import torch.nn as nn
+import wandb
+from dotenv import load_dotenv
+from omegaconf import DictConfig, OmegaConf
+from PIL import ImageDraw
+from rich.logging import RichHandler
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from mobile_sam.train import build_dataloaders, load_mobilesam_vit_t, set_seed
-from mobile_sam.utils.common import sam_denormalize, make_panel
-from mobile_sam.utils.shadow_metrics import compute_shadow_tp_union, compute_shadow_iou
-
-
-import logging
-from rich.logging import RichHandler
+from mobile_sam.utils.common import make_panel, sam_denormalize
+from mobile_sam.utils.eval import forward_mobile_sam
+from mobile_sam.utils.shadow_metrics import compute_shadow_iou, compute_shadow_tp_union
 
 
 logging.basicConfig(
@@ -49,29 +47,6 @@ def compute_counts(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5)
     return {"tp": tp, "tn": tn, "fp": fp, "fn": fn}
 
 
-def compute_metrics(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5, obj_mask: torch.Tensor = None) -> Dict[str, float]:
-    probs = torch.sigmoid(logits)
-    pred = (probs >= thr).float()
-    tp = (pred * target).sum().item()
-    tn = ((1 - pred) * (1 - target)).sum().item()
-    fp = (pred * (1 - target)).sum().item()
-    fn = ((1 - pred) * target).sum().item()
-    iou = tp / max(1.0, (tp + fp + fn))
-    prec = tp / max(1.0, (tp + fp))
-    rec = tp / max(1.0, (tp + fn))
-    f1 = 2 * prec * rec / max(1e-6, (prec + rec))
-    ber = 0.5 * (fn / max(1.0, tp + fn) + fp / max(1.0, tn + fp))
-    metrics = {"iou": iou, "f1": f1, "ber": ber, "precision": prec, "recall": rec}
-    if obj_mask is not None:
-        shadow_pred = (pred - obj_mask).clamp(min=0)
-        shadow_gt = (target - obj_mask).clamp(min=0)
-        intersection = (shadow_pred * shadow_gt).sum().item()
-        union = ((shadow_pred + shadow_gt) > 0).float().sum().item()
-        shadow_iou = intersection / max(1.0, union)
-        metrics["shadow_iou"] = shadow_iou
-    return metrics
-
-
 def finalize_metrics(tp: float, tn: float, fp: float, fn: float, shadow_tp: Optional[float] = None, shadow_union: Optional[float] = None) -> Dict[str, float]:
     iou = tp / max(1.0, (tp + fp + fn))
     prec = tp / max(1.0, (tp + fp))
@@ -85,62 +60,6 @@ def finalize_metrics(tp: float, tn: float, fp: float, fn: float, shadow_tp: Opti
         metrics["shadow_iou"] = shadow_iou
 
     return metrics
-
-
-@torch.no_grad()
-def forward_mobile_sam(
-    model: torch.nn.Module,
-    images: torch.Tensor,
-    points: List[torch.Tensor],
-    point_labels: List[torch.Tensor],
-    boxes: List[torch.Tensor],
-    multimask_output: bool = False
-) -> torch.Tensor:
-    device = images.device
-    B, _, H, W = images.shape
-    assert H == 1024 and W == 1024
-
-    image_embeddings = model.image_encoder(images)
-    image_pe = model.prompt_encoder.get_dense_pe()
-
-    logits_out: List[torch.Tensor] = []
-    for i in range(B):
-        pts_i = points[i]
-        lbs_i = point_labels[i]
-        box_i = boxes[i]
-
-        pts_tuple = None
-        if pts_i.numel() > 0:
-            coords = pts_i.to(device=device, dtype=torch.float32).unsqueeze(0)
-            labels = lbs_i.to(device=device, dtype=torch.int64).unsqueeze(0)
-            pts_tuple = (coords, labels)
-
-        box_tensor = None
-        if box_i.numel() == 4:
-            box_tensor = box_i.to(device=device, dtype=torch.float32).unsqueeze(0)
-
-        sparse_embeds, dense_embeds = model.prompt_encoder(
-            points=pts_tuple, boxes=box_tensor, masks=None
-        )
-
-        lowres_logits, iou_pred = model.mask_decoder(
-            image_embeddings=image_embeddings[i:i+1],
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_embeds,
-            dense_prompt_embeddings=dense_embeds,
-            multimask_output=multimask_output
-        )
-
-        if lowres_logits.shape[1] > 1:
-            best_idx = torch.argmax(iou_pred, dim=1)
-            chosen = lowres_logits[torch.arange(1, device=device), best_idx]
-        else:
-            chosen = lowres_logits[:, 0]
-
-        chosen = F.interpolate(chosen.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False)
-        logits_out.append(chosen)
-
-    return torch.cat(logits_out, dim=0)
 
 
 def save_panels_and_log(
