@@ -16,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from typing import List
 import albumentations as A
-
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
@@ -27,6 +26,25 @@ from mobile_sam.utils.common import sam_denormalize, color_overlay, make_panel, 
 
 from mobile_sam.prune import apply_pruning, remove_pruning_reparam
 from mobile_sam.utils.obj_prompt_shadow_dataset import AugmentationConfig
+
+import logging
+from rich.logging import RichHandler
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[
+        RichHandler(
+            rich_tracebacks=True,
+            show_time=True,
+            show_path=False
+        )
+    ]
+)
+
+log = logging.getLogger(__name__)
 
 class ShadowLoss(nn.Module):
     def __init__(self, pos_weight: float = 3.0) -> None:
@@ -252,7 +270,7 @@ class Trainer:
         if self.wandb and wb_imgs:
             self.wandb.log({"predictions": wb_imgs}, step=epoch)
 
-        print(f"[Vis] Saved {saved} images to {out_dir}")
+        log.info(f"Vis: Saved {saved} images to {out_dir}")
         self.model.train()
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -324,19 +342,16 @@ class Trainer:
             self.scheduler.step()
 
 
-            print(f"[Epoch {epoch:03d}] "
-                f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
-                f"train_loss={train_stats['train_loss']:.4f} "
-                f"train_iou={train_stats['train_iou']:.4f} "
-                f"train_f1={train_stats['train_f1']:.4f} "
-                f"train_ber={train_stats['train_ber']:.4f} "
-                f"train_shadow_iou={train_stats['train_shadow_iou']:.4f} "
-                f"val_loss={val_stats['val_loss']:.4f} "
-                f"val_iou={val_stats['val_iou']:.4f} "
-                f"val_f1={val_stats['val_f1']:.4f} "
-                f"val_ber={val_stats['val_ber']:.4f} "
-                f"val_shadow_iou={val_stats.get('val_shadow_iou', float('nan')):.4f} "
-                f"time={(time.time()-t0):.1f}s")
+            # structured logging example: include epoch as extra field for SI/parsing
+            log.info(
+                f"Epoch {epoch:03d} lr={self.optimizer.param_groups[0]['lr']:.2e} "
+                f"train_loss={train_stats['train_loss']:.4f} train_iou={train_stats['train_iou']:.4f} "
+                f"train_f1={train_stats['train_f1']:.4f} train_ber={train_stats['train_ber']:.4f} "
+                f"val_loss={val_stats['val_loss']:.4f} val_iou={val_stats['val_iou']:.4f} "
+                f"val_f1={val_stats['val_f1']:.4f} val_ber={val_stats['val_ber']:.4f} "
+                f"time={(time.time()-t0):.1f}s",
+                extra={"epoch": epoch}
+            )
 
             if self.wandb:
                 log_dict = {
@@ -356,7 +371,7 @@ class Trainer:
                     log_dict["val/shadow_iou"] = val_stats["val_shadow_iou"]
                 self.wandb.log(log_dict, step=epoch)
 
-                print(self.vis_dir, self.vis_every)
+                log.debug(self.vis_dir, self.vis_every)
                 self.save_predictions(epoch)
 
                 self.save_checkpoint(ckpt_last)
@@ -364,7 +379,7 @@ class Trainer:
                 if not math.isnan(val_stats["val_f1"]) and val_stats["val_f1"] > best_f1:
                     best_f1 = val_stats["val_f1"]
                     self.save_checkpoint(ckpt_best)
-                    print(f"[Epoch {epoch:03d}] New best F1={best_f1:.4f}. Saved: {ckpt_best}")
+                    log.info(f"New best F1={best_f1:.4f}. Saved: {ckpt_best}")
 
     def save_checkpoint(self, path: str) -> None:
         state = {
@@ -443,7 +458,7 @@ def main(cfg: DictConfig) -> None:
         seed=cfg.system.seed,
         augmenter=augmenter
     )
-    print(f"[INFO] Train dataset size: {len(train_loader.dataset)} samples")
+    log.info(f"Train dataset size: {len(train_loader.dataset)} samples")
 
     wandb_run = None
     if cfg.wandb.enabled:
@@ -477,7 +492,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     if cfg.train.resume_ckpt:
-        print(f"[INFO] Loading checkpoint from {cfg.train.resume_ckpt}")
+        log.info(f"Loading checkpoint from {cfg.train.resume_ckpt}")
         checkpoint = torch.load(cfg.train.resume_ckpt, map_location=cfg.system.device)
         if isinstance(checkpoint, dict):
             if "model" in checkpoint:
@@ -491,12 +506,12 @@ def main(cfg: DictConfig) -> None:
                     for k, v in subdict.items():
                         flat_state[f"{submodule}.{k}"] = v
                 model.load_state_dict(flat_state, strict=False)
-                print("[INFO] Loaded checkpoint (image_encoder, prompt_encoder, mask_decoder)")
+                log.info("Loaded checkpoint (image_encoder, prompt_encoder, mask_decoder)")
             else:
-                print("[ERROR] Checkpoint does not contain 'model' key or does not look like a model state_dict. Keys:", list(checkpoint.keys()))
+                log.error(f"Checkpoint does not contain 'model' key or does not look like a model state_dict. Keys: {list(checkpoint.keys())}")
                 raise RuntimeError("Invalid checkpoint format!")
         else:
-            print("[ERROR] Checkpoint is not a dictionary!")
+            log.error("Checkpoint is not a dictionary!")
             raise RuntimeError("Invalid checkpoint format!")
         try:
             if isinstance(checkpoint, dict):
@@ -504,18 +519,18 @@ def main(cfg: DictConfig) -> None:
                     trainer.optimizer.load_state_dict(checkpoint["optimizer"])
                 if "scheduler" in checkpoint:
                     trainer.scheduler.load_state_dict(checkpoint["scheduler"])
-                print("[INFO] Optimizer and scheduler state loaded.")
+            log.info("Optimizer and scheduler state loaded.")
         except Exception as e:
-            print(f"[WARN] Could not load optimizer/scheduler state: {e}")
+            log.warning(f"Could not load optimizer/scheduler state: {e}")
     elif cfg.model.pretrained_path:
-        print(f"[INFO] Loading pretrained weights from {cfg.model.pretrained_path}")
+        log.info(f"Loading pretrained weights from {cfg.model.pretrained_path}")
         state = torch.load(cfg.model.pretrained_path, map_location=cfg.system.device)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
         model.load_state_dict(state, strict=False)
 
     if cfg.model.pruning.enabled:
-        print(f"[INFO] Pruning ENABLED. Mode: {cfg.model.pruning.mode}, Amount: {cfg.model.pruning.amount}")
+        log.info(f"Pruning ENABLED. Mode: {cfg.model.pruning.mode}, Amount: {cfg.model.pruning.amount}")
         apply_pruning(
             model=trainer.model,
             mode=cfg.model.pruning.mode,
@@ -525,7 +540,7 @@ def main(cfg: DictConfig) -> None:
             structured_dim=0,
         )
     else:
-        print("[INFO] Pruning DISABLED.")
+        log.info("Pruning DISABLED.")
 
     trainer.fit(cfg.train.output_ckpt)
 
@@ -537,7 +552,7 @@ def main(cfg: DictConfig) -> None:
 
     ckpt_final = cfg.train.output_ckpt.replace('.pt', f'_final{suffix}.pt') if cfg.train.output_ckpt.endswith('.pt') else cfg.train.output_ckpt + f'_final{suffix}.pt'
     torch.save(trainer.model.state_dict(), ckpt_final)
-    print(f"[INFO] Saved final pruned model to {ckpt_final}")
+    log.info(f"[INFO] Saved final pruned model to {ckpt_final}")
 
     if wandb_run:
         wandb_run.finish()

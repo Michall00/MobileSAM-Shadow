@@ -13,6 +13,15 @@ data:
   obj_masks_dir: "${data.root_dir}/object_masks_test"
   size: 1024
   batch_size: 1
+  augment: false
+  aug_params:
+    prob: 0.5
+    flip: true
+    rotate: true
+    rotate_limit: 30
+    brightness: true
+    blur: true
+    noise: false
 
 model:
   type: "vit_t"

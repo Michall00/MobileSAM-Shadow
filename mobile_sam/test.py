@@ -20,6 +20,25 @@ from mobile_sam.utils.common import sam_denormalize, make_panel
 from mobile_sam.utils.shadow_metrics import compute_shadow_tp_union, compute_shadow_iou
 
 
+import logging
+from rich.logging import RichHandler
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[
+        RichHandler(
+            rich_tracebacks=True,
+            show_time=True,
+            show_path=False
+        )
+    ]
+)
+
+log = logging.getLogger(__name__)
+
 def compute_counts(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5) -> Dict[str, float]:
     probs = torch.sigmoid(logits)
     pred = (probs >= thr).float()
@@ -173,7 +192,7 @@ def save_predictions(
     if not vis_dir:
         return
     os.makedirs(vis_dir, exist_ok=True)
-    print("Saving predictions to", vis_dir)
+    log.info(f"Saving predictions to {vis_dir}")
 
     model.eval()
     saved = 0
@@ -218,7 +237,7 @@ def save_predictions(
     if wandb_run and wb_imgs:
         wandb_run.log({"test/predictions": wb_imgs})
 
-    print(f"[Test] Saved {saved} images to {vis_dir}")
+    log.info(f"[Test] Saved {saved} images to {vis_dir}")
 
 
 @hydra.main(config_path="../configs", config_name="config")
@@ -234,18 +253,18 @@ def main(cfg: DictConfig) -> None:
 
     if getattr(cfg.test, "ckpt_path", None):
         ckpt = cfg.test.ckpt_path
-        print(f"[INFO] Loading checkpoint from {ckpt}")
+        log.info(f"[INFO] Loading checkpoint from {ckpt}")
         state = torch.load(ckpt, map_location=device)
         if isinstance(state, dict):
             if "model" in state:
                 state = state["model"]
             model.load_state_dict(state, strict=False)
         else:
-            print("[ERROR] Checkpoint format not recognized.")
+            log.error(f"[ERROR] Checkpoint format not recognized.")
             return
     elif getattr(cfg.model, "pretrained_path", None):
         pre = cfg.model.pretrained_path
-        print(f"[INFO] Loading pretrained weights from {pre}")
+        log.info(f"[INFO] Loading pretrained weights from {pre}")
         state = torch.load(pre, map_location=device)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
@@ -322,13 +341,10 @@ def main(cfg: DictConfig) -> None:
                         )
 
     global_metrics = finalize_metrics(total_tp, total_tn, total_fp, total_fn, shadow_tp_total, shadow_union_total)
-    print(
-        f"[TEST] IoU={global_metrics['iou']:.4f} "
-        f"F1={global_metrics['f1']:.4f} "
-        f"BER={global_metrics['ber']:.4f} "
-        f"Precision={global_metrics['precision']:.4f} "
-        f"Recall={global_metrics['recall']:.4f} "
-        f"Shadow IoU={global_metrics.get('shadow_iou', float('nan')):.4f}"
+    log.info(
+        "[TEST] IoU=%.4f F1=%.4f BER=%.4f Precision=%.4f Recall=%.4f Shadow IoU=%.4f",
+        global_metrics['iou'], global_metrics['f1'], global_metrics['ber'],
+        global_metrics['precision'], global_metrics['recall'], global_metrics.get('shadow_iou', float('nan'))
     )
 
     if wb:
