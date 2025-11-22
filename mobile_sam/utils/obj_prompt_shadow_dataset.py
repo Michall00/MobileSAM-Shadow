@@ -81,25 +81,30 @@ def _tight_bbox(mask_np: np.ndarray, jitter: float = 0.1) -> np.ndarray:
 
 
 class AugmentationConfig:
-    def __init__(self, use_flip=True, use_brightness=True, use_rotate=True, use_blur=False, use_hue=False):
+    def __init__(self, cfg_aug: dict):
         self.transforms = []
+        p = cfg_aug.get("prob", 0.5)
 
-        if use_flip:
-            self.transforms.append(A.HorizontalFlip(p=1.0))
-        if use_brightness:
-            self.transforms.append(A.RandomBrightnessContrast(p=1.0))
-        if use_rotate:
-            self.transforms.append(A.Rotate(limit=15, border_mode=0, p=1.0))
-        if use_blur:
-            self.transforms.append(A.GaussianBlur(p=1.0))
-        if use_hue:
-           self.transforms.append(A.HueSaturationValue(p=1.0))
+        if cfg_aug.get("flip", False):
+            self.transforms.append(A.HorizontalFlip(p=p))
+            self.transforms.append(A.VerticalFlip(p=p))
+
+        if cfg_aug.get("rotate", False):
+            self.transforms.append(A.Rotate(limit=cfg_aug.get("rotate_limit", 15), border_mode=0, p=p))
+
+        if cfg_aug.get("brightness", False):
+            self.transforms.append(A.RandomBrightnessContrast(p=p))
+
+        if cfg_aug.get("blur", False):
+            self.transforms.append(A.GaussianBlur(blur_limit=(3, 7), p=p))
+
+        if cfg_aug.get("noise", False):
+             self.transforms.append(A.GaussNoise(p=p))
 
         self.pipeline = A.Compose(
-        self.transforms,
+            self.transforms,
             additional_targets={"obj_mask": "mask", "tgt_mask": "mask"}
         )
-
     def __call__(self, image: Image.Image, obj_mask: np.ndarray, tgt_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         augmented = self.pipeline(image=image, obj_mask=obj_mask, tgt_mask=tgt_mask)
         return augmented["image"], augmented["obj_mask"], augmented["tgt_mask"]
@@ -120,7 +125,6 @@ class ObjPromptShadowDataset(Dataset):
         neg_points_range: tuple[int,int] = (1,3),
         box_from: str = "object",  # "object" or "target"
         box_jitter: float = 0.1,
-        photometric_aug: bool = False,
         seed: Optional[int] = None,
         return_obj_mask: bool = False,
         augmenter: Optional[A.Compose] = None
