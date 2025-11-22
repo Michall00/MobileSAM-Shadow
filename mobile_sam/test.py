@@ -1,8 +1,6 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import os
-import argparse
-import math
 import csv
 import torch
 import torch.nn as nn
@@ -10,15 +8,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import ImageDraw
 import wandb
 from dotenv import load_dotenv
 
+import hydra
+from omegaconf import OmegaConf, DictConfig
+
 from mobile_sam.train import build_dataloaders, load_mobilesam_vit_t, set_seed
-from mobile_sam.utils.sbu_dataset import sbu_collate
-from mobile_sam.utils.obj_prompt_shadow_dataset import ObjPromptShadowDataset
-from mobile_sam.build_sam import sam_model_registry
-from mobile_sam.utils.common import sam_denormalize, color_overlay, make_panel
+from mobile_sam.utils.common import sam_denormalize, make_panel
 from mobile_sam.utils.shadow_metrics import compute_shadow_tp_union, compute_shadow_iou
 
 
@@ -223,42 +221,21 @@ def save_predictions(
     print(f"[Test] Saved {saved} images to {vis_dir}")
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--images_dir", type=str, required=True)
-    p.add_argument("--masks_dir", type=str, required=True)
-    p.add_argument("--obj_masks_dir", type=str, required=True)
-    p.add_argument("--size", type=int, default=1024)
-    p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--num_workers", type=int, default=1)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--amp", action="store_true")
-    p.add_argument("--ckpt", type=str, required=True)
-    p.add_argument("--pretrained", type=str, default="")
-    p.add_argument("--thr", type=float, default=0.5)
-    p.add_argument("--vis_dir", type=str, default="predictions_val_shadow")
-    p.add_argument("--vis_num", type=int, default=50)
-    p.add_argument("--save_csv", type=str, default="test_metrics.csv")
-    p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb_project", type=str, default="mobilesam-shadow")
-    p.add_argument("--wandb_entity", type=str, default=None)
-    p.add_argument("--wandb_run", type=str, default=None)
-    p.add_argument("--wandb_mode", type=str, choices=["online", "offline", "disabled"], default="online")
-    p.add_argument("--wandb_images", type=int, default=16)
-    p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
-
-
-def main() -> None:
+@hydra.main(config_path="../configs", config_name="config")
+def main(cfg: DictConfig) -> None:
     load_dotenv()
-    args = parse_args()
-    set_seed(args.seed)
+    set_seed(cfg.system.seed)
 
-    model = load_mobilesam_vit_t(None, device=args.device)
+    device = cfg.system.device
+    amp_enabled = getattr(cfg.train, "amp", True)
+    thr = getattr(cfg.test, "thr", 0.5)
 
-    if args.ckpt:
-        print(f"[INFO] Loading checkpoint from {args.ckpt}")
-        state = torch.load(args.ckpt, map_location=args.device)
+    model = load_mobilesam_vit_t(None, device=device)
+
+    if getattr(cfg.test, "ckpt_path", None):
+        ckpt = cfg.test.ckpt_path
+        print(f"[INFO] Loading checkpoint from {ckpt}")
+        state = torch.load(ckpt, map_location=device)
         if isinstance(state, dict):
             if "model" in state:
                 state = state["model"]
@@ -266,64 +243,70 @@ def main() -> None:
         else:
             print("[ERROR] Checkpoint format not recognized.")
             return
-    elif args.pretrained:
-        print(f"[INFO] Loading pretrained weights from {args.pretrained}")
-        state = torch.load(args.pretrained, map_location=args.device)
+    elif getattr(cfg.model, "pretrained_path", None):
+        pre = cfg.model.pretrained_path
+        print(f"[INFO] Loading pretrained weights from {pre}")
+        state = torch.load(pre, map_location=device)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
         model.load_state_dict(state, strict=False)
 
     loader, _ = build_dataloaders(
-        images_dir=args.images_dir,
-        masks_dir=args.masks_dir,
-        object_masks_dir=args.obj_masks_dir,
-        size=args.size,
-        batch_size=args.batch_size,
+        images_dir=cfg.data.images_dir,
+        masks_dir=cfg.data.masks_dir,
+        object_masks_dir=cfg.data.obj_masks_dir,
+        size=cfg.data.size,
+        batch_size=cfg.data.batch_size,
         val_split=0.0,  # No validation split for testing
-        num_workers=args.num_workers,
-        seed=args.seed
+        num_workers=cfg.system.num_workers,
+        seed=cfg.system.seed,
     )
 
     wb = None
-    if args.wandb:
+    if getattr(cfg, "wandb", None) and cfg.wandb.enabled:
+        wb_cfg = OmegaConf.to_container(cfg, resolve=True)
         wb = wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_run,
-            mode=args.wandb_mode,
-            config=vars(args),
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=cfg.wandb.get("run_name", None),
+            mode=cfg.wandb.mode,
+            config=wb_cfg,
         )
 
     total_tp = total_tn = total_fp = total_fn = 0.0
     shadow_tp_total, shadow_union_total = 0.0, 0.0
     saved = 0
 
-    if args.save_csv:
-        with open(args.save_csv, "w", newline="") as f:
+    save_csv = getattr(cfg.test, "save_csv", None)
+
+    if save_csv:
+        with open(save_csv, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["batch_idx", "precision", "recall", "f1", "iou", "ber", "shadow_iou"])
 
             with torch.no_grad():
                 for b_idx, batch in enumerate(tqdm(loader)):
-                    images = batch["image"].to(args.device, non_blocking=True)
-                    masks = batch["mask"].to(args.device, non_blocking=True)
-                    points = [p.to(args.device) for p in batch["points"]]
-                    labels = [l.to(args.device) for l in batch["point_labels"]]
-                    boxes = [b.to(args.device) for b in batch["boxes"]]
-                    obj_mask = batch["obj_mask"].to(args.device, non_blocking=True) if "obj_mask" in batch else None
+                    images = batch["image"].to(device, non_blocking=True)
+                    masks = batch["mask"].to(device, non_blocking=True)
+                    points = [p.to(device) for p in batch["points"]]
+                    labels = [l.to(device) for l in batch["point_labels"]]
+                    boxes = [b.to(device) for b in batch["boxes"]]
+                    obj_mask = batch.get("obj_mask")
+                    if obj_mask is not None:
+                        obj_mask = obj_mask.to(device, non_blocking=True)
 
-                    with torch.amp.autocast(args.device, enabled=(args.amp and args.device == "cuda")):
+                    with torch.amp.autocast(device, enabled=(amp_enabled and device == "cuda")):
                         logits = forward_mobile_sam(model, images, points, labels, boxes)
                         probs = torch.sigmoid(logits)
 
-                    counts = compute_counts(logits, masks, thr=args.thr)
+                    counts = compute_counts(logits, masks, thr=thr)
                     total_tp += counts["tp"]; total_tn += counts["tn"]; total_fp += counts["fp"]; total_fn += counts["fn"]
 
-                    shadow_tp, shadow_union = None, None
+                    shadow_tp = shadow_union = None
                     shadow_iou = None
                     if obj_mask is not None:
-                        shadow_tp, shadow_union = compute_shadow_tp_union(probs, masks, obj_mask, args.thr)
-                        shadow_iou = compute_shadow_iou(probs, masks, obj_mask, args.thr).item()
+                        shadow_tp, shadow_union = compute_shadow_tp_union(probs, masks, obj_mask, thr)
+                        shadow_iou = compute_shadow_iou(probs, masks, obj_mask, thr).item()
                         shadow_tp_total += shadow_tp
                         shadow_union_total += shadow_union
 
@@ -331,9 +314,11 @@ def main() -> None:
                     m["shadow_iou"] = shadow_iou if shadow_iou is not None else float("nan")
                     writer.writerow([b_idx, m["precision"], m["recall"], m["f1"], m["iou"], m["ber"], m.get("shadow_iou", float("nan"))])
 
-                    if args.vis_dir and (args.vis_num < 0 or saved < args.vis_num):
+                    vis_dir = getattr(cfg.test, "vis_dir", None)
+                    vis_num = getattr(cfg.test, "vis_num", -1)
+                    if vis_dir and (vis_num < 0 or saved < vis_num):
                         saved = save_panels_and_log(
-                            images, masks, probs, args.vis_dir, b_idx, wb, args.wandb_images, saved, boxes
+                            images, masks, probs, vis_dir, b_idx, wb, cfg.wandb.wandb_images_num, saved, boxes
                         )
 
     global_metrics = finalize_metrics(total_tp, total_tn, total_fp, total_fn, shadow_tp_total, shadow_union_total)
@@ -355,7 +340,7 @@ def main() -> None:
             "test/recall": global_metrics["recall"],
             "test/shadow_iou": global_metrics.get("shadow_iou", float("nan"))
         })
-        save_predictions(model, loader, args.device, args.vis_dir, args.vis_num, wb, args.wandb_images)
+        save_predictions(model, loader, device, getattr(cfg.test, "vis_dir", None), getattr(cfg.test, "vis_num", 0), wb, cfg.wandb.wandb_images_num)
 
         wb.finish()
 
