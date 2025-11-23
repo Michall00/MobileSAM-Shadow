@@ -96,7 +96,8 @@ class Trainer:
         vis_every: int = 5,
         vis_num: int = 8,
         wandb_run: Optional[Any] = None,
-        wandb_images: int = 16
+        wandb_images: int = 16,
+        perform_baseline_eval: bool = True,
     ) -> None:
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -119,6 +120,7 @@ class Trainer:
         self.vis_num = vis_num
         self.wandb = wandb_run
         self.wandb_images = wandb_images
+        self.perform_baseline_eval = perform_baseline_eval
 
     
     def save_predictions(self, epoch: int) -> None:
@@ -159,8 +161,8 @@ class Trainer:
                     else:
                         panel = make_panel_with_points(img_np, gt_np, pred_np, points[i].cpu().numpy())
 
-                    # panel_path = os.path.join(out_dir, f"{saved:03d}.png")
-                    # panel.save(panel_path)
+                    panel_path = os.path.join(out_dir, f"{saved:03d}.png")
+                    panel.save(panel_path)
 
                     if self.wandb and saved < self.wandb_images:
                         wb_imgs.append(wandb.Image(panel, caption=f"Sample {saved}"))
@@ -172,6 +174,33 @@ class Trainer:
 
         log.info(f"Vis: Saved {saved} images to {out_dir}")
         self.model.train()
+            
+    def baseline_evaluation(self) -> None:
+        """
+        Performs a full validation of the model in its current state.
+        
+        This is used to establish a baseline metric before training starts or 
+        to assess the performance degradation immediately after pruning (damage assessment).
+        Logs the metrics to WandB with the current epoch offset.
+        """
+        log.info(f"[Baseline Eval] Starting evaluation (Global Epoch: {self.epoch_offset})...")
+        
+        val_stats = self.validate(epoch=self.epoch_offset)
+        sparsity = self.calculate_sparsity()
+
+        if self.wandb:
+            self.wandb.log({
+                "epoch": self.epoch_offset,
+                "val/loss": val_stats["val_loss"],
+                "val/f1": val_stats["val_f1"],
+                "val/iou": val_stats["val_iou"],
+                "val/ber": val_stats["val_ber"],
+                "val/shadow_iou": val_stats.get("val_shadow_iou", float("nan")),
+                "model/lr": self.optimizer.param_groups[0]["lr"],
+                "is_baseline": 1
+            })
+            
+        log.info(f"[Baseline Eval] F1: {val_stats['val_f1']:.4f} | Sparsity: {sparsity:.2%} | Loss: {val_stats['val_loss']:.4f} | Global Epoch: {self.epoch_offset}")
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
@@ -232,7 +261,14 @@ class Trainer:
         return {"val_loss": total_loss / max(1, n_batches), "val_iou": agg["iou"], "val_f1": agg["f1"], "val_ber": agg["ber"], "val_shadow_iou": agg["shadow_iou"]}
 
     def fit(self, ckpt_path: str) -> None:
-        best_f1 = -1.0
+        """
+        Main training loop. Executes baseline evaluation if enabled, 
+        then proceeds with standard training epochs.
+        """
+        if self.perform_baseline_eval:
+            self.baseline_evaluation()
+        
+        best_f1 = 0.0
         ckpt_last = ckpt_path.replace('.pt', '_last.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_last.pt'
         ckpt_best = ckpt_path.replace('.pt', '_best.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_best.pt'
         for epoch in tqdm(range(1, self.max_epochs + 1)):
