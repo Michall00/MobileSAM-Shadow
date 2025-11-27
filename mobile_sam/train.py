@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import random
@@ -17,6 +18,7 @@ from torch.utils.data import ConcatDataset, DataLoader, random_split
 from tqdm import tqdm
 import wandb
 import segmentation_models_pytorch as smp
+
 from mobile_sam.build_sam import sam_model_registry
 from mobile_sam.prune import apply_pruning, remove_pruning_reparam
 from mobile_sam.utils.common import make_panel_with_points, sam_denormalize
@@ -27,9 +29,9 @@ from mobile_sam.utils.dataset_utils import (
     AugmentationConfig,
     two_mask_collate,
 )
-
-import logging
-
+from mobile_sam.utils.eval import compute_metrics, forward_mobile_sam
+from mobile_sam.utils.obj_prompt_reflection_dataset import ObjPromptReflectionDataset
+from mobile_sam.utils.obj_prompt_shadow_dataset import ObjPromptShadowDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -672,30 +674,76 @@ def main(cfg: DictConfig) -> None:
             state = state["state_dict"]
         model.load_state_dict(state, strict=False)
 
-    if cfg.model.pruning.enabled:
-        log.info(f"Pruning ENABLED. Mode: {cfg.model.pruning.mode}, Amount: {cfg.model.pruning.amount}")
-        apply_pruning(
-            model=trainer.model,
-            mode=cfg.model.pruning.mode,
-            amount=cfg.model.pruning.amount,
-            include_linear=True,
-            structured_n=1,
-            structured_dim=0,
-        )
-    else:
-        log.info("Pruning DISABLED.")
+    
+    log.info("--- PHASE 1: Base Training ---")
 
     trainer.fit(cfg.train.output_ckpt)
+    
+    total_epochs_passed += cfg.train.epochs
 
-    if cfg.model.pruning.enabled:
+    torch.save(trainer.model.state_dict(), "model_base_full_backup.pt")
+
+    PRUNE_ENABLE = True
+    ITERATIONS = 10
+    AMOUNT_PER_ITER = 0.1
+    
+    REWIND_LR = 1e-4
+    L1_LAMBDA = 1e-5
+
+    if PRUNE_ENABLE:
+        log.info(f"START ITERATIVE PRUNING: {ITERATIONS} iterations of {AMOUNT_PER_ITER*100}%")
+
+        for i in range(1, ITERATIONS + 1):
+            log.info(f"\n[PRUNING] Iteration {i}/{ITERATIONS}...")
+            
+            target_sparsity = 1.0 - ((1.0 - AMOUNT_PER_ITER) ** i)
+            
+            if target_sparsity < 0.2:
+                ft_epochs = 2
+            elif target_sparsity < 0.5:
+                ft_epochs = 3
+            else:
+                ft_epochs = 5
+            
+            apply_pruning(
+                model=trainer.model,
+                mode="global_l1_unstructured", 
+                amount=AMOUNT_PER_ITER,
+                include_linear=True,
+                structured_n=1,
+                structured_dim=0,
+            )
+
+            trainer_ft = Trainer(
+                model=trainer.model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                lr=REWIND_LR,
+                weight_decay=cfg.train.weight_decay,
+                max_epochs=ft_epochs,
+                grad_clip=cfg.train.grad_clip,
+                amp=cfg.train.amp,
+                device=cfg.system.device,
+                epoch_offset=total_epochs_passed,
+                vis_dir=cfg.test.vis_dir,
+                vis_every=cfg.test.vis_every,
+                vis_num=cfg.test.vis_num,
+                wandb_run=wandb_run,
+                wandb_images=cfg.wandb.wandb_images_num,
+                l1_lambda=L1_LAMBDA,
+            )
+
+            ft_ckpt_name = f"model_pruned_iter_{i}.pt"
+            trainer_ft.fit(ft_ckpt_name)
+            
+            total_epochs_passed += ft_epochs
+
+        log.info("Removing pruning reparameterization (burning zeros)...")
         remove_pruning_reparam(trainer.model)
-        suffix = "_pruned"
-    else:
-        suffix = ""
-
-    ckpt_final = cfg.train.output_ckpt.replace('.pt', f'_final{suffix}.pt') if cfg.train.output_ckpt.endswith('.pt') else cfg.train.output_ckpt + f'_final{suffix}.pt'
-    torch.save(trainer.model.state_dict(), ckpt_final)
-    log.info(f"[INFO] Saved final pruned model to {ckpt_final}")
+        
+        final_name = f"models/model_final_pruned_{ITERATIONS}x{int(AMOUNT_PER_ITER*100)}.pt"
+        torch.save(trainer.model.state_dict(), final_name)
+        log.info(f"Saved final model: {final_name}")
 
     if wandb_run:
         wandb_run.finish()
