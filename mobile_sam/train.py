@@ -17,6 +17,8 @@ from rich.logging import RichHandler
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
+import wandb
+import segmentation_models_pytorch as smp
 from mobile_sam.build_sam import sam_model_registry
 from mobile_sam.prune import apply_pruning, remove_pruning_reparam
 # from mobile_sam.utils.sbu_dataset import SBUShadowDataset, sbu_collate
@@ -46,18 +48,12 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
-class ShadowLoss(nn.Module):
+class ArtefactLoss(nn.Module):
     def __init__(self, pos_weight: float = 3.0) -> None:
         super().__init__()
         self.register_buffer("pos_weight", torch.tensor([pos_weight], dtype=torch.float32))
         self.bce = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
-
-    @staticmethod
-    def dice(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        num = 2 * (probs * target).sum(dim=(1, 2, 3)) + 1e-6
-        den = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) + 1e-6
-        return 1.0 - (num / den).mean()
+        self.dice = smp.losses.DiceLoss(mode='binary', from_logits=True)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return self.bce(logits, target) + self.dice(logits, target)
@@ -102,7 +98,7 @@ class Trainer:
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.loss_fn = ShadowLoss(pos_weight=3.0).to(device)
+        self.loss_fn = ArtefactLoss(pos_weight=3.0).to(device)
         enc_params = freeze_non_encoder(self.model)
         self.optimizer = torch.optim.AdamW(enc_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=max_epochs)
