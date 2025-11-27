@@ -324,6 +324,20 @@ class Trainer:
             "scheduler": self.scheduler.state_dict(),
         }
         torch.save(state, path)
+        
+    def calculate_sparsity(self) -> float:
+        total_params = 0
+        zero_params = 0
+        
+        for module in self.model.modules():
+            if hasattr(module, "weight_mask"):
+                mask = module.weight_mask
+                total_params += mask.numel()
+                zero_params += torch.sum(mask == 0).item()
+                
+            elif hasattr(module, "weight") and isinstance(module.weight, torch.nn.Parameter):
+                total_params += module.weight.numel()
+        return 0.0 if total_params == 0 else zero_params / total_params
 
 
 def build_dataloaders(
