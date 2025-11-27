@@ -2,31 +2,29 @@ import math
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-import albumentations as A
+import albumentations as A  # noqa: N812
 import hydra
 import numpy as np
 import torch
 import torch.nn as nn
-import wandb
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image, ImageDraw
+from PIL import ImageDraw
 from rich.logging import RichHandler
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import ConcatDataset, DataLoader, random_split
 from tqdm import tqdm
-
 import wandb
 import segmentation_models_pytorch as smp
 from mobile_sam.build_sam import sam_model_registry
 from mobile_sam.prune import apply_pruning, remove_pruning_reparam
-# from mobile_sam.utils.sbu_dataset import SBUShadowDataset, sbu_collate
 from mobile_sam.utils.common import make_panel_with_points, sam_denormalize
-from mobile_sam.utils.eval import compute_metrics, forward_mobile_sam
-from mobile_sam.utils.obj_prompt_shadow_dataset import (
+from mobile_sam.utils.dataset_utils import (
+    TASK_NORMAL,
+    TASK_REFLECTION,
+    TASK_SHADOW,
     AugmentationConfig,
-    ObjPromptShadowDataset,
     two_mask_collate,
 )
 
@@ -65,7 +63,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def freeze_non_encoder(model: nn.Module) -> List[nn.Parameter]:
+def freeze_non_encoder(model: nn.Module) -> list[nn.Parameter]:
     for p in getattr(model, "prompt_encoder").parameters():
         p.requires_grad = False
     for p in getattr(model, "mask_decoder").parameters():
@@ -81,17 +79,18 @@ class Trainer:
         self,
         model: nn.Module,
         train_loader: DataLoader,
-        val_loader: Optional[DataLoader],
+        val_loader: DataLoader | None,
         lr: float = 1e-4,
         weight_decay: float = 5e-2,
         max_epochs: int = 10,
         grad_clip: float = 1.0,
         amp: bool = True,
         device: str = "cuda",
-        vis_dir: Optional[str] = None,
+        epoch_offset: int = 0,
+        vis_dir: str | None = None,
         vis_every: int = 5,
         vis_num: int = 8,
-        wandb_run: Optional[Any] = None,
+        wandb_run: Any | None = None,
         wandb_images: int = 16,
         perform_baseline_eval: bool = True,
         l1_lambda: float = 0.0,
@@ -142,7 +141,7 @@ class Trainer:
         self.model.eval()
 
         saved = 0
-        wb_imgs: List[Any] = []
+        wb_imgs: list[Any] = []
 
         with torch.no_grad():
             for b_idx, batch in enumerate(loader):
@@ -170,11 +169,14 @@ class Trainer:
                     else:
                         panel = make_panel_with_points(img_np, gt_np, pred_np, points[i].cpu().numpy())
 
-                    panel_path = os.path.join(out_dir, f"{saved:03d}.png")
-                    panel.save(panel_path)
+                    # panel_path = os.path.join(out_dir, f"{saved:03d}.png")
+                    # panel.save(panel_path)
 
-                    if self.wandb and saved < self.wandb_images:
-                        wb_imgs.append(wandb.Image(panel, caption=f"Sample {saved}"))
+                    try:
+                        if self.wandb and saved < self.wandb_images:
+                            wb_imgs.append(wandb.Image(panel, caption=f"Sample {saved}"))
+                    except Exception as e:
+                        log.warning(f"Failed to log image to WandB: {e}")
 
                     saved += 1
 
@@ -697,7 +699,6 @@ def main(cfg: DictConfig) -> None:
 
     if wandb_run:
         wandb_run.finish()
-
-
+        
 if __name__ == "__main__":
     main()
