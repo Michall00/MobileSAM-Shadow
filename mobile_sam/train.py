@@ -341,35 +341,80 @@ class Trainer:
 
 
 def build_dataloaders(
-    images_dir: str,
-    masks_dir: str,
-    object_masks_dir: str,
-    size: int,
-    batch_size: int,
+    cfg_data: DictConfig,
     val_split: float,
     num_workers: int,
     seed: int,
-    augmenter: Optional[A.Compose] = None
-) -> Tuple[DataLoader, Optional[DataLoader]]:
-    ds = ObjPromptShadowDataset(
-        images_dir=images_dir,
-        obj_masks_dir=object_masks_dir,
-        target_masks_dir=masks_dir,
-        size=size,
-        seed=seed,
-        return_obj_mask=True,
-        augmenter=augmenter
-    )
-    if val_split <= 0.0:
-        return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate), None
-    val_len = int(len(ds) * val_split)
-    train_len = len(ds) - val_len
-    g = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(ds, [train_len, val_len], generator=g)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=two_mask_collate)
-    return train_loader, val_loader
+    augmenter: A.Compose | None = None
+) -> tuple[DataLoader, DataLoader | None]:
+    
+    datasets = []
+    
+    if cfg_data.get("shadow", None):
+        log.info("Initializing Shadow Dataset...")
+        ds_shadow = ObjPromptShadowDataset(
+            images_dir=cfg_data.shadow.images_dir,
+            object_masks_dir=cfg_data.shadow.obj_masks_dir,
+            target_masks_dir=cfg_data.shadow.masks_dir,
+            size=cfg_data.size,
+            seed=seed,
+            return_obj_mask=True,
+            augmenter=augmenter
+        )
+        datasets.append(ds_shadow)
 
+    if cfg_data.get("reflection", None):
+        log.info("Initializing Reflection Dataset...")
+        ds_refl = ObjPromptReflectionDataset(
+            images_dir=cfg_data.reflection.images_dir,
+            object_masks_dir=cfg_data.reflection.obj_masks_dir,
+            target_masks_dir=cfg_data.reflection.masks_dir,
+            size=cfg_data.size,
+            seed=seed,
+            return_obj_mask=True,
+            augmenter=augmenter,
+            task_id=TASK_REFLECTION
+        )
+        datasets.append(ds_refl)
+        
+    if cfg_data.get("normal", None):
+        log.info("Initializing Normal Dataset...")
+        ds_normal = ObjPromptReflectionDataset(
+            images_dir=cfg_data.normal.images_dir,
+            object_masks_dir=cfg_data.normal.obj_masks_dir,
+            target_masks_dir=cfg_data.normal.masks_dir,
+            size=cfg_data.size,
+            seed=seed,
+            return_obj_mask=False,
+            augmenter=augmenter,
+            task_id=TASK_NORMAL
+        )
+        datasets.append(ds_normal)
+
+    if not datasets:
+        raise ValueError("No datasets configured! Check config.yaml")
+
+    if len(datasets) > 1:
+        log.info(f"Combining {len(datasets)} datasets.")
+        full_ds = ConcatDataset(datasets)
+    else:
+        full_ds = datasets[0]
+
+    if val_split <= 0.0:
+        return DataLoader(full_ds, batch_size=cfg_data.batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate), None
+    
+    val_len = int(len(full_ds) * val_split)
+    train_len = len(full_ds) - val_len
+    
+    g = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(full_ds, [train_len, val_len], generator=g)
+    
+    log.info(f"Combined Data: Train={len(train_ds)}, Val={len(val_ds)}")
+    
+    train_loader = DataLoader(train_ds, batch_size=cfg_data.batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate)
+    val_loader = DataLoader(val_ds, batch_size=cfg_data.batch_size, shuffle=False, num_workers=num_workers, collate_fn=two_mask_collate)
+    
+    return train_loader, val_loader
 
     
 def load_mobilesam_vit_t(ckpt_path: str | None, device: str = "cuda") -> nn.Module:
@@ -398,11 +443,7 @@ def main(cfg: DictConfig) -> None:
         augmenter = AugmentationConfig(aug_params)
 
     train_loader, val_loader = build_dataloaders(
-        images_dir=cfg.data.images_dir,
-        masks_dir=cfg.data.masks_dir,
-        object_masks_dir=cfg.data.obj_masks_dir,
-        size=cfg.data.size,
-        batch_size=cfg.data.batch_size,
+        cfg_data=cfg.data,
         val_split=cfg.train.val_split,
         num_workers=cfg.system.num_workers,
         seed=cfg.system.seed,
