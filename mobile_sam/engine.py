@@ -18,8 +18,6 @@ from tqdm import tqdm
 import math
 import time
 
-
-
 log = get_logger(__name__)
 
 class ArtefactLoss(nn.Module):
@@ -53,11 +51,14 @@ class Trainer:
         wandb_images: int = 16,
         perform_baseline_eval: bool = True,
         l1_lambda: float = 0.0,
+        patience: int = 10,
+        custom_sparsity: float | None = None,
+        artefact_weight: float = 1.0
     ) -> None:
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.loss_fn = ArtefactLoss(pos_weight=3.0).to(device)
+        self.loss_fn = ArtefactLoss(pos_weight=artefact_weight).to(device)
         enc_params = freeze_non_encoder(self.model)
         self.optimizer = torch.optim.AdamW(enc_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=max_epochs)
@@ -66,11 +67,14 @@ class Trainer:
         self.amp = amp
         self.device = device
         self.epoch_offset = epoch_offset
+        self.patience = patience
+        
         enable_amp = bool(amp and self.device == "cuda")
         try:
             self.scaler = torch.amp.GradScaler(self.device, enabled=enable_amp)
         except TypeError:
             self.scaler = torch.amp.GradScaler(enabled=enable_amp)
+            
         self.vis_dir = vis_dir
         self.vis_every = vis_every
         self.vis_num = vis_num
@@ -78,6 +82,7 @@ class Trainer:
         self.wandb_images = wandb_images
         self.perform_baseline_eval = perform_baseline_eval
         self.l1_lambda = l1_lambda
+        self.custom_sparsity = custom_sparsity
         
         self.define_params_to_regularize()
         
@@ -118,7 +123,6 @@ class Trainer:
                     gt_np = masks[i, 0].cpu().numpy() > 0.5
                     pred_np = preds[i, 0].cpu().numpy() > 0.5
 
-                    # Include bounding boxes in the panel
                     box = boxes[i]
                     if box.numel() == 4:
                         x0, y0, x1, y1 = box.cpu().numpy()
@@ -128,9 +132,6 @@ class Trainer:
                     else:
                         panel = make_panel_with_points(img_np, gt_np, pred_np, points[i].cpu().numpy())
 
-                    # panel_path = os.path.join(out_dir, f"{saved:03d}.png")
-                    # panel.save(panel_path)
-
                     try:
                         if self.wandb and saved < self.wandb_images:
                             wb_imgs.append(wandb.Image(panel, caption=f"Sample {saved}"))
@@ -138,6 +139,10 @@ class Trainer:
                         log.warning(f"Failed to log image to WandB: {e}")
 
                     saved += 1
+                    if saved >= self.vis_num:
+                        break
+                if saved >= self.vis_num:
+                    break
 
         if self.wandb and wb_imgs:
             self.wandb.log({"predictions": wb_imgs}, step=epoch)
@@ -146,17 +151,9 @@ class Trainer:
         self.model.train()
             
     def baseline_evaluation(self) -> None:
-        """
-        Performs a full validation of the model in its current state.
-        
-        This is used to establish a baseline metric before training starts or 
-        to assess the performance degradation immediately after pruning (damage assessment).
-        Logs the metrics to WandB with the current epoch offset.
-        """
         log.info(f"[Baseline Eval] Starting evaluation (Global Epoch: {self.epoch_offset})...")
-        
         val_stats = self.validate(epoch=self.epoch_offset)
-        sparsity = self.calculate_sparsity()
+        sparsity = self.custom_sparsity if self.custom_sparsity is not None else self.calculate_sparsity()
 
         if self.wandb:
             self.wandb.log({
@@ -174,7 +171,6 @@ class Trainer:
         log.info(f"[Baseline Eval] F1: {val_stats['val_f1']:.4f} | Sparsity: {sparsity:.2%} | Loss: {val_stats['val_loss']:.4f} | Global Epoch: {self.epoch_offset}")
 
     def _update_metrics(self, aggregator: dict, metrics: dict, prefix: str = ""):
-        """Helper to update aggregated metrics dictionary safely."""
         for k, v in metrics.items():
             key = f"{prefix}{k}" if prefix else k
             if key not in aggregator:
@@ -185,21 +181,13 @@ class Trainer:
         self.model.train()
         total_loss, n_batches = 0.0, 0
         agg = {
-            "iou": 0.0, 
-            "f1": 0.0, 
-            "ber": 0.0, 
-            "shadow_iou": 0.0, 
-            "shadow_f1": 0.0,
-            "reflection_iou": 0.0, 
-            "reflection_f1": 0.0
+            "iou": 0.0, "f1": 0.0, "ber": 0.0, 
+            "shadow_iou": 0.0, "shadow_f1": 0.0,
+            "reflection_iou": 0.0, "reflection_f1": 0.0
         }
-        counts = {
-            "total": 0, 
-            "shadow": 0, 
-            "reflection": 0
-        }
+        counts = {"total": 0, "shadow": 0, "reflection": 0}
         
-        for batch in tqdm(self.train_loader):
+        for batch in tqdm(self.train_loader, desc=f"Epoch {epoch}", leave=False):
             images = batch["image"].to(self.device, non_blocking=True)
             masks = batch["mask"].to(self.device, non_blocking=True)
             obj_mask = batch["obj_mask"].to(self.device, non_blocking=True) if "obj_mask" in batch else None
@@ -276,6 +264,33 @@ class Trainer:
             
         out["global_epoch"] = self.epoch_offset + epoch
         return out
+    
+    @torch.no_grad()
+    def benchmark(self, num_runs: int = 100, warm_up: int = 10) -> dict[str, float]:
+        self.model.eval()
+        dummy_input = torch.randn(1, 3, 1024, 1024).to(self.device)
+        
+        for _ in range(warm_up):
+            self.model.image_encoder(dummy_input)
+            
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+            
+        start_time = time.perf_counter()
+
+        for _ in range(num_runs):
+            self.model.image_encoder(dummy_input)
+            
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+
+        end_time = time.perf_counter()
+        
+        avg_time = (end_time - start_time) / num_runs
+        fps = 1.0 / avg_time if avg_time > 0 else 0.0
+        
+        log.info(f"Benchmark Speed: {avg_time*1000:.2f} ms/img | {fps:.2f} FPS")
+        return {"inference_ms": avg_time * 1000, "fps": fps}
 
     @torch.no_grad()
     def validate(self, epoch: int) -> dict[str, float]:
@@ -283,32 +298,23 @@ class Trainer:
             return {"val_loss": math.nan, "val_iou": math.nan, "val_f1": math.nan, "val_ber": math.nan}
         
         self.model.eval()
+        t0 = time.perf_counter()
+        
         total_loss = 0.0
         n_batches = 0
-        agg = {
-            "iou": 0.0, 
-            "f1": 0.0, 
-            "ber": 0.0, 
-            "shadow_iou": 0.0, 
-            "shadow_f1": 0.0,
-            "reflection_iou": 0.0, 
-            "reflection_f1": 0.0
-        }
-        counts = {
-            "total": 0,
-            "shadow": 0,
-            "reflection": 0
-        }
+        agg = {"iou": 0.0, "f1": 0.0, "ber": 0.0, "shadow_iou": 0.0, "shadow_f1": 0.0, "reflection_iou": 0.0, "reflection_f1": 0.0}
+        counts = {"total": 0, "shadow": 0, "reflection": 0}
         
         for batch in self.val_loader:
             images = batch["image"].to(self.device, non_blocking=True)
             masks = batch["mask"].to(self.device, non_blocking=True)
-            obj_mask = batch["obj_mask"].to(self.device, non_blocking=True) if "obj_mask" in batch else None
-            task_ids = batch["task_id"].to(self.device)           
-             
+            task_ids = batch["task_id"].to(self.device)
             points = [p.to(self.device) for p in batch["points"]]
             labels = [l.to(self.device) for l in batch["point_labels"]]
             boxes = [b.to(self.device) for b in batch["boxes"]]
+            obj_mask = batch.get("obj_mask", None)
+            if obj_mask is not None:
+                obj_mask = obj_mask.to(self.device, non_blocking=True)
             
             logits = forward_mobile_sam(self.model, images, points, labels, boxes)
             loss = self.loss_fn(logits, masks)
@@ -319,26 +325,16 @@ class Trainer:
 
             m_global = compute_metrics(logits, masks, thr=0.5)
             self._update_metrics(agg, m_global)
-                        
+            
             shadow_mask = (task_ids == TASK_SHADOW)
             if shadow_mask.any():
-                m_shadow = compute_metrics(
-                    logits[shadow_mask], 
-                    masks[shadow_mask], 
-                    thr=0.5, 
-                    obj_mask=obj_mask[shadow_mask] if obj_mask is not None else None
-                )
+                m_shadow = compute_metrics(logits[shadow_mask], masks[shadow_mask], thr=0.5, obj_mask=obj_mask[shadow_mask] if obj_mask is not None else None)
                 self._update_metrics(agg, m_shadow, prefix="shadow_")
                 counts["shadow"] += 1
 
             refl_mask = (task_ids == TASK_REFLECTION)
             if refl_mask.any():
-                m_refl = compute_metrics(
-                    logits[refl_mask], 
-                    masks[refl_mask], 
-                    thr=0.5, 
-                    obj_mask=obj_mask[refl_mask] if obj_mask is not None else None
-                )
+                m_refl = compute_metrics(logits[refl_mask], masks[refl_mask], thr=0.5, obj_mask=obj_mask[refl_mask] if obj_mask is not None else None)
                 self._update_metrics(agg, m_refl, prefix="reflection_")
                 counts["reflection"] += 1
 
@@ -346,87 +342,68 @@ class Trainer:
         out = {f"{prefix}_loss": total_loss / max(1, n_batches)}
         for metric in ["iou", "f1", "ber"]:
             out[f"{prefix}_{metric}"] = agg[metric] / max(1, counts["total"])
-            
         if counts["shadow"] > 0:
             out[f"{prefix}_shadow_iou"] = agg["shadow_iou"] / counts["shadow"]
             out[f"{prefix}_shadow_f1"] = agg["shadow_f1"] / counts["shadow"]
-            
         if counts["reflection"] > 0:
             out[f"{prefix}_reflection_iou"] = agg["reflection_iou"] / counts["reflection"]
             out[f"{prefix}_reflection_f1"] = agg["reflection_f1"] / counts["reflection"]
             
-        out["global_epoch"] = self.epoch_offset + epoch 
+        out["global_epoch"] = self.epoch_offset + epoch
+        out["val_time_sec"] = time.perf_counter() - t0
         return out
 
     def fit(self, ckpt_path: str) -> None:
-        """
-        Main training loop. Executes baseline evaluation if enabled, 
-        then proceeds with standard training epochs.
-        """
         if self.perform_baseline_eval:
             self.baseline_evaluation()
         
         best_f1 = 0.0
+        patience_counter = 0
+        
         ckpt_last = ckpt_path.replace('.pt', '_last.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_last.pt'
         ckpt_best = ckpt_path.replace('.pt', '_best.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_best.pt'
         
         for epoch in tqdm(range(1, self.max_epochs + 1)):
-            t0 = time.time()
             train_stats = self.train_epoch(epoch)
             val_stats = self.validate(epoch)
             self.scheduler.step()
             
             current_global_epoch = self.epoch_offset + epoch
-            sparsity = self.calculate_sparsity()
+            sparsity = self.custom_sparsity if self.custom_sparsity is not None else self.calculate_sparsity()
+            
+            benchmark_speed_stats = self.benchmark(num_runs=100, warm_up=10)
 
-            log.info(
-                f"Epoch {epoch:03d} lr={self.optimizer.param_groups[0]['lr']:.2e} "
-                f"train_loss={train_stats['train_loss']:.4f} train_iou={train_stats['train_iou']:.4f} "
-                f"train_f1={train_stats['train_f1']:.4f} train_ber={train_stats['train_ber']:.4f} "
-                f"val_loss={val_stats['val_loss']:.4f} val_iou={val_stats['val_iou']:.4f} "
-                f"val_f1={val_stats['val_f1']:.4f} val_ber={val_stats['val_ber']:.4f} "
-                f"time={time.time()-t0:.1f}s "
-                f"sparsity={sparsity:.4f} "
-                f"global_epoch={current_global_epoch}",
-                extra={"epoch": epoch}
+            log_msg = (
+                f"Epoch {epoch:03d} | F1: {val_stats['val_f1']:.4f} | "
+                f"Loss: {train_stats['train_loss']:.4f}/{val_stats['val_loss']:.4f} | "
+                f"Sparsity: {sparsity:.2%} | Time: {val_stats['val_time_sec']:.1f}s | "
+                f"Inf: {benchmark_speed_stats['inference_ms']:.2f}ms"
             )
+            log.info(log_msg)
 
             if self.wandb:
                 log_dict = {
-                    "epoch": epoch,
                     "lr": self.optimizer.param_groups[0]["lr"],
-                    "train/loss": train_stats["train_loss"],
-                    "train/iou": train_stats["train_iou"],
-                    "train/f1": train_stats["train_f1"],
-                    "train/ber": train_stats["train_ber"],
-                    "val/loss": val_stats["val_loss"],
-                    "val/iou": val_stats["val_iou"],
-                    "val/f1": val_stats["val_f1"],
-                    "val/ber": val_stats["val_ber"],
                     "sparsity": sparsity,
-                    "global_epoch": current_global_epoch
+                    **train_stats,
+                    **val_stats,
+                    **benchmark_speed_stats
                 }
-                if "val_shadow_iou" in val_stats:
-                    log_dict["train/shadow_iou"] = train_stats["train_shadow_iou"]
-                    log_dict["train/shadow_f1"] = train_stats["train_shadow_f1"]
-                    log_dict["val/shadow_f1"] = val_stats["val_shadow_f1"]
-                    log_dict["val/shadow_iou"] = val_stats["val_shadow_iou"]
-                if "val_reflection_iou" in val_stats:
-                    log_dict["train/reflection_iou"] = train_stats["train_reflection_iou"]
-                    log_dict["train/reflection_f1"] = train_stats["train_reflection_f1"]
-                    log_dict["val/reflection_f1"] = val_stats["val_reflection_f1"]
-                    log_dict["val/reflection_iou"] = val_stats["val_reflection_iou"]
                 self.wandb.log(log_dict, step=current_global_epoch)
 
-                log.debug(self.vis_dir, self.vis_every)
-                self.save_predictions(current_global_epoch)
+            self.save_predictions(current_global_epoch)
+            self.save_checkpoint(ckpt_last)
 
-                self.save_checkpoint(ckpt_last)
-
-                if not math.isnan(val_stats["val_f1"]) and val_stats["val_f1"] > best_f1:
-                    best_f1 = val_stats["val_f1"]
-                    self.save_checkpoint(ckpt_best)
-                    log.info(f"New best F1={best_f1:.4f}. Saved: {ckpt_best}")
+            if not math.isnan(val_stats["val_f1"]) and val_stats["val_f1"] > best_f1:
+                best_f1 = val_stats["val_f1"]
+                self.save_checkpoint(ckpt_best)
+                log.info(f"New best F1={best_f1:.4f}. Saved: {ckpt_best}")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    log.info(f"Early Stopping triggered after {epoch} epochs (No improvement for {self.patience} epochs).")
+                    break
 
     def save_checkpoint(self, path: str) -> None:
         state = {

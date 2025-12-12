@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
 import wandb
 
-from mobile_sam.prune import apply_pruning, remove_pruning_reparam
 from mobile_sam.utils.dataset_utils import AugmentationConfig
 from mobile_sam.common import get_logger, set_seed, setup_logger
 from mobile_sam.model import load_mobilesam_vit_t
@@ -36,6 +35,7 @@ def main(cfg: DictConfig) -> None:
     )
     log.info(f"Train dataset size: {len(train_loader.dataset)} samples")
 
+    run_name = f"BASE_Ep{cfg.train.epochs}_LR{cfg.train.lr:.0e}_BS{cfg.data.batch_size}"
     wandb_run = None
     if cfg.wandb.enabled:
         config_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
@@ -44,6 +44,7 @@ def main(cfg: DictConfig) -> None:
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             mode=cfg.wandb.mode,
+            name=run_name,
             config=config_dict
         )
         
@@ -65,6 +66,7 @@ def main(cfg: DictConfig) -> None:
         vis_num=cfg.test.vis_num,
         wandb_run=wandb_run,
         wandb_images=cfg.wandb.wandb_images_num,
+        artefact_weight=cfg.train.artefact_loss_weight
     )
 
     if cfg.train.resume_ckpt:
@@ -112,69 +114,7 @@ def main(cfg: DictConfig) -> None:
     
     total_epochs_passed += cfg.train.epochs
 
-    torch.save(trainer.model.state_dict(), "model_base_full_backup.pt")
-
-    PRUNE_ENABLE = True
-    ITERATIONS = 15
-    AMOUNT_PER_ITER = 0.05
-    
-    REWIND_LR = 1e-4
-    L1_LAMBDA = 1e-5
-
-    if PRUNE_ENABLE:
-        log.info(f"START ITERATIVE PRUNING: {ITERATIONS} iterations of {AMOUNT_PER_ITER*100}%")
-
-        for i in range(1, ITERATIONS + 1):
-            log.info(f"\n[PRUNING] Iteration {i}/{ITERATIONS}...")
-            
-            target_sparsity = 1.0 - ((1.0 - AMOUNT_PER_ITER) ** i)
-            
-            if target_sparsity < 0.2:
-                ft_epochs = 2
-            elif target_sparsity < 0.5:
-                ft_epochs = 3
-            else:
-                ft_epochs = 5
-            
-            apply_pruning(
-                model=trainer.model,
-                mode="layer_l1_unstructured", 
-                amount=AMOUNT_PER_ITER,
-                include_linear=True,
-                structured_n=1,
-                structured_dim=0,
-            )
-
-            trainer_ft = Trainer(
-                model=trainer.model,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                lr=REWIND_LR,
-                weight_decay=cfg.train.weight_decay,
-                max_epochs=ft_epochs,
-                grad_clip=cfg.train.grad_clip,
-                amp=cfg.train.amp,
-                device=cfg.system.device,
-                epoch_offset=total_epochs_passed,
-                vis_dir=cfg.test.vis_dir,
-                vis_every=cfg.test.vis_every,
-                vis_num=cfg.test.vis_num,
-                wandb_run=wandb_run,
-                wandb_images=cfg.wandb.wandb_images_num,
-                l1_lambda=L1_LAMBDA,
-            )
-
-            ft_ckpt_name = f"model_pruned_iter_{i}.pt"
-            trainer_ft.fit(ft_ckpt_name)
-            
-            total_epochs_passed += ft_epochs
-
-        log.info("Removing pruning reparameterization (burning zeros)...")
-        remove_pruning_reparam(trainer.model)
-        
-        final_name = f"models/model_final_pruned_{ITERATIONS}x{int(AMOUNT_PER_ITER*100)}.pt"
-        torch.save(trainer.model.state_dict(), final_name)
-        log.info(f"Saved final model: {final_name}")
+    torch.save(trainer.model.state_dict(), "model_base.pt")
 
     if wandb_run:
         wandb_run.finish()

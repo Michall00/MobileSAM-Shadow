@@ -4,7 +4,7 @@ defaults:
 system:
   device: "cuda"
   seed: 42
-  num_workers: 1
+  num_workers: 0
 
 data:
   size: 1024
@@ -18,55 +18,58 @@ data:
     brightness: true
     blur: true
     noise: false
+
   reflection:
-    root_dir: "data\\DEROBA"
-    images_dir: "${data.reflection.root_dir}\\images"
-    masks_dir: "${data.reflection.root_dir}\\masks"
-    obj_masks_dir: "${data.reflection.root_dir}\\object_masks"
+    root_dir: "data/DEROBA_test2"
+    images_dir: "${data.reflection.root_dir}/images"
+    masks_dir: "${data.reflection.root_dir}/masks"
+    obj_masks_dir: "${data.reflection.root_dir}/object_masks"
   shadow:
-    root_dir: "data\\prepared_soba"
-    images_dir: "${data.shadow.root_dir}\\images"
-    masks_dir: "${data.shadow.root_dir}\\masks"
-    obj_masks_dir: "${data.shadow.root_dir}\\object_masks"
+    root_dir: "data/prepared_soba"
+    images_dir: "${data.shadow.root_dir}/images_test"
+    masks_dir: "${data.shadow.root_dir}/masks_test"
+    obj_masks_dir: "${data.shadow.root_dir}/object_masks_test"
   normal:
-    root_dir: "data\\DEROBA"
-    images_dir: "${data.normal.root_dir}\\images_without_reflection"
-    masks_dir: "${data.normal.root_dir}\\object_masks"
-    obj_masks_dir: "${data.normal.root_dir}\\object_masks"
+    root_dir: "data/DEROBA_test2"
+    images_dir: "${data.normal.root_dir}/images_without_reflection"
+    masks_dir: "${data.normal.root_dir}/object_masks"
+    obj_masks_dir: "${data.normal.root_dir}/object_masks"
 
 model:
   type: "vit_t"
   pretrained_path: "weights/mobile_sam.pt"
-  pruning:
-    enabled: true
-    mode: "global_l1_unstructured"
-    prune_steps: 15
-    prune_amount_per_step: 0.05
-    prune_l1_lambda: 1e-5
-    prune_rewind_lr: 1e-4
 
-wandb:
+pruning:
   enabled: true
-  project: "mobilesam-shadow-test"
-  entity: null
-  mode: "online"
-  run_name: ""
-  wandb_images_num: 100
+  base_ckpt: "weights/mobile_sam.pt"
+  iterations: 5
+  finetune_epochs: 5
+  lr: 1e-4
+  patience: 3
+  target_sparsity: 0.5      
+  amount_per_iter: 0.1
 
 train:
-  epochs: 5
+  epochs: 10
   lr: 1e-4
   weight_decay: 5e-2
   grad_clip: 1.0
   amp: true
   val_split: 0.1
-  resume_ckpt: "" 
-  output_ckpt: "mobilesam_aug_best.pt"
-  vis_every: 1
+  patience: 3
+  resume_ckpt: "weights/mobilesam_base_best.pt"
+  output_ckpt: "weights/mobilesam_base.pt"
+  artefact_loss_weight: 3.0
 
 test:
-  ckpt_path: null
-  vis_dir: "predictions_val_shadow"
-  vis_num: 50
-  vis_every: 1
-  save_csv: "test_metrics.csv"
+  vis_dir: "predictions_debug"
+  vis_num: 20
+  vis_every: 5
+
+wandb:
+  enabled: true
+  project: "mobilesam-pruning-experiments"
+  entity: null
+  mode: "online"
+  wandb_images_num: 50
+  run_name: "run_${now:%Y-%m-%d_%H-%M-%S}"
