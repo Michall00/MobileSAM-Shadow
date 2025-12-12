@@ -1,0 +1,69 @@
+defaults:
+  - _self_
+
+system:
+  device: "cuda"
+  seed: 42
+  num_workers: 1
+
+data:
+  size: 1024
+  batch_size: 2
+  augment: true
+  aug_params:
+    prob: 0.5
+    flip: true
+    rotate: true
+    rotate_limit: 30
+    brightness: true
+    blur: true
+    noise: false
+  shadow:
+    root_dir: "data/prepared_soba"
+    images_dir: "${data.shadow.root_dir}/images"
+    masks_dir: "${data.shadow.root_dir}/masks"
+    obj_masks_dir: "${data.shadow.root_dir}/object_masks"
+  reflection:
+    root_dir: "data/DEROBA"
+    images_dir: "${data.reflection.root_dir}/images"
+    masks_dir: "${data.reflection.root_dir}/masks"
+    obj_masks_dir: "${data.reflection.root_dir}/object_masks"
+  normal:
+    root_dir: "data/DEROBA"
+    images_dir: "${data.normal.root_dir}/images_without_reflection"
+    masks_dir: "${data.normal.root_dir}/object_masks"
+    obj_masks_dir: "${data.normal.root_dir}/object_masks"
+
+model:
+  type: "vit_t"
+  pretrained_path: "weights/mobile_sam.pt"
+  pruning:
+    enabled: true
+    mode: "layer_ln_structured"
+    amount: 0.2
+
+wandb:
+  enabled: true
+  project: "mobilesam-shadow-test"
+  entity: null
+  mode: "online"
+  run_name: ""
+  wandb_images_num: 50
+
+train:
+  epochs: 5
+  lr: 1e-4
+  weight_decay: 5e-2
+  grad_clip: 1.0
+  amp: true
+  val_split: 0.1
+  resume_ckpt: "" 
+  output_ckpt: "mobilesam_best.pt"
+  vis_every: 1
+
+test:
+  ckpt_path: null
+  vis_dir: "predictions_val_shadow"
+  vis_num: 50
+  vis_every: 1
+  save_csv: "test_metrics.csv"
