@@ -22,11 +22,22 @@ dependencies = [
     "samexporter>=0.3.0",
     "scikit-image>=0.25.2",
     "segment-anything>=1.0",
+    "segmentation-models-pytorch>=0.5.0",
     "timm>=1.0.19",
     "torch>=2.8.0",
+    "torch-pruning>=1.6.1",
     "wandb>=0.21.4",
 ]
 
+[[tool.uv.index]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-gpu" }
+torchvision = { index = "pytorch-gpu" }
+torchaudio = { index = "pytorch-gpu" }
 
 [tool.ruff]
 line-length = 100
