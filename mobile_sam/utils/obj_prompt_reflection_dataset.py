@@ -116,11 +116,7 @@ class ObjPromptReflectionDataset(Dataset):
         }
 
 
-
-
-
-def sam_denormalize(img_t: torch.Tensor) -> np.ndarray:
-    """Odwrotność normalizacji SAM dla wizualizacji (Tensor -> Numpy Image)"""
+def sam_denormalize_int(img_t: torch.Tensor) -> np.ndarray:
     x = img_t.detach().cpu().float().numpy()           
     mean = np.array([123.675, 116.28, 103.53], np.float32)[:, None, None]
     std  = np.array([58.395, 57.12, 57.375], np.float32)[:, None, None]
@@ -130,7 +126,6 @@ def sam_denormalize(img_t: torch.Tensor) -> np.ndarray:
     return x
 
 def _split_points(points: torch.Tensor, labels: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
-    """Rozdziela punkty na pozytywne (1) i negatywne (0)"""
     if points.numel() == 0 or labels.numel() == 0:
         return np.zeros((0,2), dtype=np.int32), np.zeros((0,2), dtype=np.int32)
     pts = points.cpu().numpy()
@@ -148,7 +143,7 @@ def show_object_prompt_sample(batch: dict, index: int = 0, title_suffix: str = "
     lbs = batch["point_labels"][index]
     box = batch["boxes"][index]
 
-    img_np = sam_denormalize(img_t)
+    img_np = sam_denormalize_int(img_t)
     target_np = target_mask.cpu().numpy() > 0.5
     
     pos, neg = _split_points(pts, lbs)

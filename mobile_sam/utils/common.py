@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 
-def sam_denormalize(img_t: torch.Tensor) -> np.ndarray:
+def sam_denormalize_float(img_t: torch.Tensor) -> np.ndarray:
     mean = torch.tensor([123.675, 116.28, 103.53], device=img_t.device).view(3, 1, 1)
     std = torch.tensor([58.395, 57.12, 57.375], device=img_t.device).view(3, 1, 1)
     x = (img_t * std + mean) / 255.0

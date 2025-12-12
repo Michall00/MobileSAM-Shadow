@@ -1,0 +1,451 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from typing import Any
+import segmentation_models_pytorch as smp
+from mobile_sam.model import freeze_non_encoder
+from mobile_sam.utils.eval import compute_metrics, forward_mobile_sam
+import os
+from mobile_sam.utils.dataset_utils import (
+    TASK_REFLECTION,
+    TASK_SHADOW,
+)
+from mobile_sam.utils.common import sam_denormalize_float, make_panel_with_points
+from mobile_sam.common import get_logger 
+from PIL import ImageDraw
+import wandb
+from tqdm import tqdm
+import math
+import time
+
+
+
+log = get_logger(__name__)
+
+class ArtefactLoss(nn.Module):
+    def __init__(self, pos_weight: float = 3.0) -> None:
+        super().__init__()
+        self.register_buffer("pos_weight", torch.tensor([pos_weight], dtype=torch.float32))
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        self.dice = smp.losses.DiceLoss(mode='binary', from_logits=True)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return self.bce(logits, target) + self.dice(logits, target)
+
+
+class Trainer:
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader | None,
+        lr: float = 1e-4,
+        weight_decay: float = 5e-2,
+        max_epochs: int = 10,
+        grad_clip: float = 1.0,
+        amp: bool = True,
+        device: str = "cuda",
+        epoch_offset: int = 0,
+        vis_dir: str | None = None,
+        vis_every: int = 5,
+        vis_num: int = 8,
+        wandb_run: Any | None = None,
+        wandb_images: int = 16,
+        perform_baseline_eval: bool = True,
+        l1_lambda: float = 0.0,
+    ) -> None:
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.loss_fn = ArtefactLoss(pos_weight=3.0).to(device)
+        enc_params = freeze_non_encoder(self.model)
+        self.optimizer = torch.optim.AdamW(enc_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=max_epochs)
+        self.max_epochs = max_epochs
+        self.grad_clip = grad_clip
+        self.amp = amp
+        self.device = device
+        self.epoch_offset = epoch_offset
+        enable_amp = bool(amp and self.device == "cuda")
+        try:
+            self.scaler = torch.amp.GradScaler(self.device, enabled=enable_amp)
+        except TypeError:
+            self.scaler = torch.amp.GradScaler(enabled=enable_amp)
+        self.vis_dir = vis_dir
+        self.vis_every = vis_every
+        self.vis_num = vis_num
+        self.wandb = wandb_run
+        self.wandb_images = wandb_images
+        self.perform_baseline_eval = perform_baseline_eval
+        self.l1_lambda = l1_lambda
+        
+        self.define_params_to_regularize()
+        
+    def define_params_to_regularize(self) -> None:
+        self.params_to_regularize = [
+            p for name, p in self.model.named_parameters()
+            if p.requires_grad 
+            and 'bias' not in name 
+            and 'norm' not in name 
+            and 'bn' not in name
+        ]
+    
+    def save_predictions(self, epoch: int) -> None:
+        if not self.vis_dir:
+            return
+        out_dir = os.path.join(self.vis_dir, f"epoch_{epoch:03d}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        loader = self.val_loader if self.val_loader is not None else self.train_loader
+        self.model.eval()
+
+        saved = 0
+        wb_imgs: list[Any] = []
+
+        with torch.no_grad():
+            for b_idx, batch in enumerate(loader):
+                images = batch["image"].to(self.device, non_blocking=True)
+                masks = batch["mask"].to(self.device, non_blocking=True)
+                points = [p.to(self.device) for p in batch["points"]]
+                labels = [l.to(self.device) for l in batch["point_labels"]]
+                boxes = [b.to(self.device) for b in batch["boxes"]]
+
+                logits = forward_mobile_sam(self.model, images, points, labels, boxes)
+                preds = torch.sigmoid(logits) >= 0.5
+
+                for i in range(images.size(0)):
+                    img_np = sam_denormalize_float(images[i])
+                    gt_np = masks[i, 0].cpu().numpy() > 0.5
+                    pred_np = preds[i, 0].cpu().numpy() > 0.5
+
+                    # Include bounding boxes in the panel
+                    box = boxes[i]
+                    if box.numel() == 4:
+                        x0, y0, x1, y1 = box.cpu().numpy()
+                        panel = make_panel_with_points(img_np, gt_np, pred_np, points[i].cpu().numpy())
+                        draw = ImageDraw.Draw(panel)
+                        draw.rectangle([x0, y0, x1, y1], outline="blue", width=2)
+                    else:
+                        panel = make_panel_with_points(img_np, gt_np, pred_np, points[i].cpu().numpy())
+
+                    # panel_path = os.path.join(out_dir, f"{saved:03d}.png")
+                    # panel.save(panel_path)
+
+                    try:
+                        if self.wandb and saved < self.wandb_images:
+                            wb_imgs.append(wandb.Image(panel, caption=f"Sample {saved}"))
+                    except Exception as e:
+                        log.warning(f"Failed to log image to WandB: {e}")
+
+                    saved += 1
+
+        if self.wandb and wb_imgs:
+            self.wandb.log({"predictions": wb_imgs}, step=epoch)
+
+        log.info(f"Vis: Saved {saved} images to {out_dir}")
+        self.model.train()
+            
+    def baseline_evaluation(self) -> None:
+        """
+        Performs a full validation of the model in its current state.
+        
+        This is used to establish a baseline metric before training starts or 
+        to assess the performance degradation immediately after pruning (damage assessment).
+        Logs the metrics to WandB with the current epoch offset.
+        """
+        log.info(f"[Baseline Eval] Starting evaluation (Global Epoch: {self.epoch_offset})...")
+        
+        val_stats = self.validate(epoch=self.epoch_offset)
+        sparsity = self.calculate_sparsity()
+
+        if self.wandb:
+            self.wandb.log({
+                "epoch": self.epoch_offset,
+                "val/loss": val_stats["val_loss"],
+                "val/f1": val_stats["val_f1"],
+                "val/iou": val_stats["val_iou"],
+                "val/ber": val_stats["val_ber"],
+                "val/shadow_iou": val_stats.get("val_shadow_iou", float("nan")),
+                "sparsity": sparsity,
+                "model/lr": self.optimizer.param_groups[0]["lr"],
+                "is_baseline": 1
+            })
+            
+        log.info(f"[Baseline Eval] F1: {val_stats['val_f1']:.4f} | Sparsity: {sparsity:.2%} | Loss: {val_stats['val_loss']:.4f} | Global Epoch: {self.epoch_offset}")
+
+    def _update_metrics(self, aggregator: dict, metrics: dict, prefix: str = ""):
+        """Helper to update aggregated metrics dictionary safely."""
+        for k, v in metrics.items():
+            key = f"{prefix}{k}" if prefix else k
+            if key not in aggregator:
+                aggregator[key] = 0.0
+            aggregator[key] += v
+
+    def train_epoch(self, epoch: int) -> dict[str, float]:
+        self.model.train()
+        total_loss, n_batches = 0.0, 0
+        agg = {
+            "iou": 0.0, 
+            "f1": 0.0, 
+            "ber": 0.0, 
+            "shadow_iou": 0.0, 
+            "shadow_f1": 0.0,
+            "reflection_iou": 0.0, 
+            "reflection_f1": 0.0
+        }
+        counts = {
+            "total": 0, 
+            "shadow": 0, 
+            "reflection": 0
+        }
+        
+        for batch in tqdm(self.train_loader):
+            images = batch["image"].to(self.device, non_blocking=True)
+            masks = batch["mask"].to(self.device, non_blocking=True)
+            obj_mask = batch["obj_mask"].to(self.device, non_blocking=True) if "obj_mask" in batch else None
+            task_ids = batch["task_id"].to(self.device)
+            
+            points = [p.to(self.device) for p in batch["points"]]
+            labels = [l.to(self.device) for l in batch["point_labels"]]
+            boxes = [b.to(self.device) for b in batch["boxes"]]
+
+            with torch.amp.autocast(self.device, enabled=(self.amp and self.device == "cuda")):
+                logits = forward_mobile_sam(self.model, images, points, labels, boxes)
+                main_loss = self.loss_fn(logits, masks)
+                
+                l1_reg = torch.tensor(0.0, device=self.device)
+                if self.l1_lambda > 0.0:
+                    l1_reg = sum(p.abs().sum() for p in self.params_to_regularize)
+                            
+                loss = main_loss + (self.l1_lambda * l1_reg)
+
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            
+            if self.grad_clip is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.image_encoder.parameters(), self.grad_clip)
+            
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            total_loss += float(main_loss.item())
+            l1_loss_accum = float(l1_reg.item())
+            n_batches += 1
+            counts["total"] += 1
+
+            m_global = compute_metrics(logits, masks, thr=0.5)
+            self._update_metrics(agg, m_global)
+
+            shadow_mask = (task_ids == TASK_SHADOW)
+            if shadow_mask.any():
+                m_shadow = compute_metrics(
+                    logits[shadow_mask], 
+                    masks[shadow_mask], 
+                    thr=0.5, 
+                    obj_mask=obj_mask[shadow_mask] if obj_mask is not None else None
+                )
+                self._update_metrics(agg, m_shadow, prefix="shadow_")
+                counts["shadow"] += 1
+
+            refl_mask = (task_ids == TASK_REFLECTION)
+            if refl_mask.any():
+                m_refl = compute_metrics(
+                    logits[refl_mask], 
+                    masks[refl_mask], 
+                    thr=0.5, 
+                    obj_mask=obj_mask[refl_mask] if obj_mask is not None else None
+                )
+                self._update_metrics(agg, m_refl, prefix="reflection_")
+                counts["reflection"] += 1
+
+        prefix = "train"
+        out = {f"{prefix}_loss": total_loss / max(1, n_batches)}
+        out[f"{prefix}_l1_norm"] = l1_loss_accum / max(1, n_batches)
+        
+        for metric in ["iou", "f1", "ber"]:
+            out[f"{prefix}_{metric}"] = agg[metric] / max(1, counts["total"])
+            
+        if counts["shadow"] > 0:
+            out[f"{prefix}_shadow_iou"] = agg["shadow_iou"] / counts["shadow"]
+            out[f"{prefix}_shadow_f1"] = agg["shadow_f1"] / counts["shadow"]
+            
+        if counts["reflection"] > 0:
+            out[f"{prefix}_reflection_iou"] = agg["reflection_iou"] / counts["reflection"]
+            out[f"{prefix}_reflection_f1"] = agg["reflection_f1"] / counts["reflection"]
+            
+        out["global_epoch"] = self.epoch_offset + epoch
+        return out
+
+    @torch.no_grad()
+    def validate(self, epoch: int) -> dict[str, float]:
+        if self.val_loader is None:
+            return {"val_loss": math.nan, "val_iou": math.nan, "val_f1": math.nan, "val_ber": math.nan}
+        
+        self.model.eval()
+        total_loss = 0.0
+        n_batches = 0
+        agg = {
+            "iou": 0.0, 
+            "f1": 0.0, 
+            "ber": 0.0, 
+            "shadow_iou": 0.0, 
+            "shadow_f1": 0.0,
+            "reflection_iou": 0.0, 
+            "reflection_f1": 0.0
+        }
+        counts = {
+            "total": 0,
+            "shadow": 0,
+            "reflection": 0
+        }
+        
+        for batch in self.val_loader:
+            images = batch["image"].to(self.device, non_blocking=True)
+            masks = batch["mask"].to(self.device, non_blocking=True)
+            obj_mask = batch["obj_mask"].to(self.device, non_blocking=True) if "obj_mask" in batch else None
+            task_ids = batch["task_id"].to(self.device)           
+             
+            points = [p.to(self.device) for p in batch["points"]]
+            labels = [l.to(self.device) for l in batch["point_labels"]]
+            boxes = [b.to(self.device) for b in batch["boxes"]]
+            
+            logits = forward_mobile_sam(self.model, images, points, labels, boxes)
+            loss = self.loss_fn(logits, masks)
+            
+            total_loss += float(loss.item())
+            n_batches += 1
+            counts["total"] += 1
+
+            m_global = compute_metrics(logits, masks, thr=0.5)
+            self._update_metrics(agg, m_global)
+                        
+            shadow_mask = (task_ids == TASK_SHADOW)
+            if shadow_mask.any():
+                m_shadow = compute_metrics(
+                    logits[shadow_mask], 
+                    masks[shadow_mask], 
+                    thr=0.5, 
+                    obj_mask=obj_mask[shadow_mask] if obj_mask is not None else None
+                )
+                self._update_metrics(agg, m_shadow, prefix="shadow_")
+                counts["shadow"] += 1
+
+            refl_mask = (task_ids == TASK_REFLECTION)
+            if refl_mask.any():
+                m_refl = compute_metrics(
+                    logits[refl_mask], 
+                    masks[refl_mask], 
+                    thr=0.5, 
+                    obj_mask=obj_mask[refl_mask] if obj_mask is not None else None
+                )
+                self._update_metrics(agg, m_refl, prefix="reflection_")
+                counts["reflection"] += 1
+
+        prefix = "val"
+        out = {f"{prefix}_loss": total_loss / max(1, n_batches)}
+        for metric in ["iou", "f1", "ber"]:
+            out[f"{prefix}_{metric}"] = agg[metric] / max(1, counts["total"])
+            
+        if counts["shadow"] > 0:
+            out[f"{prefix}_shadow_iou"] = agg["shadow_iou"] / counts["shadow"]
+            out[f"{prefix}_shadow_f1"] = agg["shadow_f1"] / counts["shadow"]
+            
+        if counts["reflection"] > 0:
+            out[f"{prefix}_reflection_iou"] = agg["reflection_iou"] / counts["reflection"]
+            out[f"{prefix}_reflection_f1"] = agg["reflection_f1"] / counts["reflection"]
+            
+        out["global_epoch"] = self.epoch_offset + epoch 
+        return out
+
+    def fit(self, ckpt_path: str) -> None:
+        """
+        Main training loop. Executes baseline evaluation if enabled, 
+        then proceeds with standard training epochs.
+        """
+        if self.perform_baseline_eval:
+            self.baseline_evaluation()
+        
+        best_f1 = 0.0
+        ckpt_last = ckpt_path.replace('.pt', '_last.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_last.pt'
+        ckpt_best = ckpt_path.replace('.pt', '_best.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_best.pt'
+        
+        for epoch in tqdm(range(1, self.max_epochs + 1)):
+            t0 = time.time()
+            train_stats = self.train_epoch(epoch)
+            val_stats = self.validate(epoch)
+            self.scheduler.step()
+            
+            current_global_epoch = self.epoch_offset + epoch
+            sparsity = self.calculate_sparsity()
+
+            log.info(
+                f"Epoch {epoch:03d} lr={self.optimizer.param_groups[0]['lr']:.2e} "
+                f"train_loss={train_stats['train_loss']:.4f} train_iou={train_stats['train_iou']:.4f} "
+                f"train_f1={train_stats['train_f1']:.4f} train_ber={train_stats['train_ber']:.4f} "
+                f"val_loss={val_stats['val_loss']:.4f} val_iou={val_stats['val_iou']:.4f} "
+                f"val_f1={val_stats['val_f1']:.4f} val_ber={val_stats['val_ber']:.4f} "
+                f"time={time.time()-t0:.1f}s "
+                f"sparsity={sparsity:.4f} "
+                f"global_epoch={current_global_epoch}",
+                extra={"epoch": epoch}
+            )
+
+            if self.wandb:
+                log_dict = {
+                    "epoch": epoch,
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "train/loss": train_stats["train_loss"],
+                    "train/iou": train_stats["train_iou"],
+                    "train/f1": train_stats["train_f1"],
+                    "train/ber": train_stats["train_ber"],
+                    "val/loss": val_stats["val_loss"],
+                    "val/iou": val_stats["val_iou"],
+                    "val/f1": val_stats["val_f1"],
+                    "val/ber": val_stats["val_ber"],
+                    "sparsity": sparsity,
+                    "global_epoch": current_global_epoch
+                }
+                if "val_shadow_iou" in val_stats:
+                    log_dict["train/shadow_iou"] = train_stats["train_shadow_iou"]
+                    log_dict["train/shadow_f1"] = train_stats["train_shadow_f1"]
+                    log_dict["val/shadow_f1"] = val_stats["val_shadow_f1"]
+                    log_dict["val/shadow_iou"] = val_stats["val_shadow_iou"]
+                if "val_reflection_iou" in val_stats:
+                    log_dict["train/reflection_iou"] = train_stats["train_reflection_iou"]
+                    log_dict["train/reflection_f1"] = train_stats["train_reflection_f1"]
+                    log_dict["val/reflection_f1"] = val_stats["val_reflection_f1"]
+                    log_dict["val/reflection_iou"] = val_stats["val_reflection_iou"]
+                self.wandb.log(log_dict, step=current_global_epoch)
+
+                log.debug(self.vis_dir, self.vis_every)
+                self.save_predictions(current_global_epoch)
+
+                self.save_checkpoint(ckpt_last)
+
+                if not math.isnan(val_stats["val_f1"]) and val_stats["val_f1"] > best_f1:
+                    best_f1 = val_stats["val_f1"]
+                    self.save_checkpoint(ckpt_best)
+                    log.info(f"New best F1={best_f1:.4f}. Saved: {ckpt_best}")
+
+    def save_checkpoint(self, path: str) -> None:
+        state = {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+        }
+        torch.save(state, path)
+        
+    def calculate_sparsity(self) -> float:
+        total_params = 0
+        zero_params = 0
+        
+        for module in self.model.modules():
+            if hasattr(module, "weight_mask"):
+                mask = module.weight_mask
+                total_params += mask.numel()
+                zero_params += torch.sum(mask == 0).item()
+                
+            elif hasattr(module, "weight") and isinstance(module.weight, torch.nn.Parameter):
+                total_params += module.weight.numel()
+        return 0.0 if total_params == 0 else zero_params / total_params

@@ -1,5 +1,4 @@
 import numpy as np
-from typing import Tuple
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -111,14 +110,14 @@ def generate_prompts(mask: np.ndarray) -> dict:
         return {"points": None, "labels": None, "boxes": box}
     
 
-def _sam_denormalize(img_t: torch.Tensor) -> np.ndarray:
+def sam_denormalize_float(img_t: torch.Tensor) -> np.ndarray:
     mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1).to(img_t.device)
     std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1).to(img_t.device)
     x = (img_t * std + mean) / 255.0
     x = x.clamp(0.0, 1.0)
     return x.permute(1, 2, 0).cpu().numpy()
 
-def _split_points_by_label(points: torch.Tensor, labels: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+def _split_points_by_label(points: torch.Tensor, labels: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     if points.numel() == 0 or labels.numel() == 0:
         return np.zeros((0,2), dtype=np.int32), np.zeros((0,2), dtype=np.int32)
     pts = points.cpu().numpy()
@@ -134,7 +133,7 @@ def show_sample(batch: dict, index: int = 0) -> None:
     lbs = batch["point_labels"][index]     # [N] int32
     box = batch["boxes"][index]            # [4] or [0]
 
-    img_np = _sam_denormalize(img_t)
+    img_np = sam_denormalize_float(img_t)
     mask_np = mask_t.cpu().numpy()
 
     pos, neg = _split_points_by_label(pts, lbs)
