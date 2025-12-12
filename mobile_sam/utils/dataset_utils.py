@@ -4,6 +4,63 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from PIL import Image
+from torch import Tensor
+import albumentations as A
+
+TASK_SHADOW = 0
+TASK_REFLECTION = 1
+TASK_NORMAL = 2
+
+class AugmentationConfig:
+    def __init__(self, cfg_aug: dict):
+        self.transforms = []
+        p = cfg_aug.get("prob", 0.5)
+
+        if cfg_aug.get("flip", False):
+            self.transforms.append(A.HorizontalFlip(p=p))
+
+        if cfg_aug.get("rotate", False):
+            self.transforms.append(A.Rotate(limit=cfg_aug.get("rotate_limit", 15), border_mode=0, p=p))
+
+        if cfg_aug.get("brightness", False):
+            self.transforms.append(A.RandomBrightnessContrast(p=p))
+
+        if cfg_aug.get("blur", False):
+            self.transforms.append(A.GaussianBlur(blur_limit=(3, 7), p=p))
+
+        if cfg_aug.get("noise", False):
+             self.transforms.append(A.GaussNoise(p=p))
+
+        self.pipeline = A.Compose(
+            self.transforms,
+            additional_targets={"obj_mask": "mask", "tgt_mask": "mask"}
+        )
+    def __call__(self, image: Image.Image, obj_mask: np.ndarray, tgt_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        augmented = self.pipeline(image=image, obj_mask=obj_mask, tgt_mask=tgt_mask)
+        return augmented["image"], augmented["obj_mask"], augmented["tgt_mask"]
+    
+    @staticmethod
+    def to_pil(image: np.ndarray | Image.Image) -> Image.Image:
+        return image if isinstance(image, Image.Image) else Image.fromarray(image)
+
+
+def two_mask_collate(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+    images = torch.stack([b["image"] for b in batch], dim=0)
+    masks = torch.stack([b["mask"] for b in batch], dim=0)
+    points = [b["points"] for b in batch]
+    point_labels = [b["point_labels"] for b in batch]
+    boxes = [b["boxes"] for b in batch]
+    out: dict[str, Tensor] = {"image": images, "mask": masks, "points": points, "point_labels": point_labels, "boxes": boxes}
+    
+    if "obj_mask" in batch[0]:
+        out["obj_mask"] = torch.stack([b["obj_mask"] for b in batch], dim=0)
+
+    if "task_id" in batch[0]:
+        out["task_id"] = torch.tensor([b["task_id"] for b in batch], dtype=torch.long)
+        
+    return out
+
 
 def sample_positive_points(mask: np.ndarray, num_points: int = 1) -> np.ndarray:
     ys, xs = np.where(mask > 0)
@@ -111,3 +168,75 @@ def show_sample(batch: dict, index: int = 0) -> None:
     axes[2].set_xlim([0, W]); axes[2].set_ylim([H, 0]); axes[2].axis("off")
     plt.tight_layout()
     plt.show()
+
+
+def _to_list(x: str | list[str]) -> list[str]:
+    return [x] if isinstance(x, str) else x
+
+def _to_rgb(img: Image.Image) -> Image.Image:
+    return img.convert("RGB")
+
+def _to_bin_mask(img: Image.Image) -> Image.Image:
+    if img.mode != "L":
+        img = img.convert("L")
+    return img.point(lambda p: 255 if p >= 128 else 0, mode="L")
+
+def _sam_resize_pad_hw(h: int, w: int, target: int) -> tuple[float, int, int, int, int]:
+    scale = target / max(h, w)
+    new_h = int(round(h * scale))
+    new_w = int(round(w * scale))
+    return scale, new_h, new_w, target - new_h, target - new_w
+
+def _resize_pad_rgb(img: Image.Image, target: int) -> Image.Image:
+    w, h = img.size
+    scale, nh, nw, _, _ = _sam_resize_pad_hw(h, w, target)
+    img = img.resize((nw, nh), Image.BILINEAR)
+    out = Image.new("RGB", (target, target), (255, 255, 255))
+    out.paste(img, (0, 0))
+    return out
+
+def _resize_pad_mask(mask: Image.Image, target: int) -> Image.Image:
+    w, h = mask.size
+    scale, nh, nw, _, _ = _sam_resize_pad_hw(h, w, target)
+    mask = mask.resize((nw, nh), Image.NEAREST)
+    out = Image.new("L", (target, target), 0)
+    out.paste(mask, (0, 0))
+    return out
+
+def _normalize_sam(img_t: Tensor) -> Tensor:
+    mean = torch.tensor([123.675, 116.28, 103.53]).view(3,1,1)
+    std = torch.tensor([58.395, 57.12, 57.375]).view(3,1,1)
+    return (img_t * 255.0 - mean) / std
+
+def _img_to_tensor(img: Image.Image) -> Tensor:
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    return torch.from_numpy(arr)
+
+def _mask_to_tensor(mask: Image.Image) -> Tensor:
+    arr = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.float32)
+    arr = np.expand_dims(arr, 0)
+    return torch.from_numpy(arr)
+
+def _sample_pos_from_object(obj_mask_np: np.ndarray, k: int) -> np.ndarray:
+    ys, xs = np.where(obj_mask_np > 0)
+    if xs.size == 0:
+        return np.empty((0,2), dtype=np.int32)
+    idx = np.random.choice(xs.size, size=min(k, xs.size), replace=False)
+    return np.stack([xs[idx], ys[idx]], axis=1).astype(np.int32)
+
+def _tight_bbox(mask_np: np.ndarray, jitter: float = 0.1) -> np.ndarray:
+    ys, xs = np.where(mask_np > 0)
+    if xs.size == 0:
+        return np.empty((0,), dtype=np.int32)
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
+    jx = max(1, int(round(jitter * w)))
+    jy = max(1, int(round(jitter * h)))
+    x0 = max(0, x0 - np.random.randint(0, jx + 1))
+    y0 = max(0, y0 - np.random.randint(0, jy + 1))
+    x1 = x1 + np.random.randint(0, jx + 1)
+    y1 = y1 + np.random.randint(0, jy + 1)
+    return np.array([x0, y0, x1, y1], dtype=np.int32)

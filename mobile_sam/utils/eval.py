@@ -30,16 +30,23 @@ def compute_metrics(
     ber = 0.5 * (fn / max(1.0, tp + fn) + fp / max(1.0, tn + fp))
 
     metrics: Dict[str, float] = {"iou": iou, "f1": f1, "ber": ber}
+
     if include_precision_recall:
         metrics["precision"] = prec
         metrics["recall"] = rec
 
     if obj_mask is not None:
-        shadow_pred = (pred - obj_mask).clamp(min=0)
-        shadow_gt = (target - obj_mask).clamp(min=0)
-        intersection = (shadow_pred * shadow_gt).sum().item()
-        union = ((shadow_pred + shadow_gt) > 0).float().sum().item()
-        metrics["shadow_iou"] = intersection / max(1.0, union)
+        artifact_pred = (pred - obj_mask).clamp(min=0)
+        artifact_gt = (target - obj_mask).clamp(min=0)
+        
+        intersection = (artifact_pred * artifact_gt).sum().item()
+
+        union_pixels = ((artifact_pred + artifact_gt) > 0).float().sum().item()
+        metrics["shadow_iou"] = intersection / max(1.0, union_pixels)
+        
+        area_pred = artifact_pred.sum().item()
+        area_gt = artifact_gt.sum().item()
+        metrics["shadow_f1"] = (2 * intersection) / max(1e-6, area_pred + area_gt)
 
     return metrics
 
