@@ -2,45 +2,59 @@ defaults:
   - _self_
 
 system:
-  device: "cpu"
+  device: "cuda"
   seed: 42
   num_workers: 1
 
 data:
-  root_dir: "/home/msadowski/Studia/Inzynierka/MobileSAM/dataset/prepared_soba"
-  images_dir: "${data.root_dir}/images_test"
-  masks_dir: "${data.root_dir}/masks_test"
-  obj_masks_dir: "${data.root_dir}/object_masks_test"
   size: 1024
-  batch_size: 1
+  batch_size: 4
   augment: false
   aug_params:
     prob: 0.5
     flip: true
-    rotate: true
+    rotate: false
     rotate_limit: 30
     brightness: true
     blur: true
     noise: false
+  reflection:
+    root_dir: "data\\DEROBA"
+    images_dir: "${data.reflection.root_dir}\\images"
+    masks_dir: "${data.reflection.root_dir}\\masks"
+    obj_masks_dir: "${data.reflection.root_dir}\\object_masks"
+  shadow:
+    root_dir: "data\\prepared_soba"
+    images_dir: "${data.shadow.root_dir}\\images"
+    masks_dir: "${data.shadow.root_dir}\\masks"
+    obj_masks_dir: "${data.shadow.root_dir}\\object_masks"
+  normal:
+    root_dir: "data\\DEROBA"
+    images_dir: "${data.normal.root_dir}\\images_without_reflection"
+    masks_dir: "${data.normal.root_dir}\\object_masks"
+    obj_masks_dir: "${data.normal.root_dir}\\object_masks"
 
 model:
   type: "vit_t"
-  pretrained_path: "/home/msadowski/Studia/Inzynierka/MobileSAM/weights/mobile_sam.pt"
+  pretrained_path: "weights/mobile_sam.pt"
   pruning:
     enabled: true
-    mode: "layer_ln_structured"
-    amount: 0.2
+    mode: "global_l1_unstructured"
+    prune_steps: 15
+    prune_amount_per_step: 0.05
+    prune_l1_lambda: 1e-5
+    prune_rewind_lr: 1e-4
 
 wandb:
   enabled: true
-  project: "mobilesam-shadow"
+  project: "mobilesam-shadow-test"
   entity: null
   mode: "online"
   run_name: ""
-  wandb_images_num: 4
+  wandb_images_num: 100
 
 train:
-  epochs: 1
+  epochs: 5
   lr: 1e-4
   weight_decay: 5e-2
   grad_clip: 1.0
