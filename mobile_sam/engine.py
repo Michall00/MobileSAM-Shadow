@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Any
+from typing import Any, Literal
 import segmentation_models_pytorch as smp
 from mobile_sam.model import freeze_non_encoder
 from mobile_sam.utils.eval import compute_metrics, forward_mobile_sam
@@ -53,15 +53,39 @@ class Trainer:
         l1_lambda: float = 0.0,
         patience: int = 10,
         custom_sparsity: float | None = None,
-        artefact_weight: float = 1.0
+        artefact_weight: float = 1.0,
+        scheduler_type: str = "cosine",
+        tuning_strategy: Literal["encoder_only", "full_model"] = "encoder_only"
     ) -> None:
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.loss_fn = ArtefactLoss(pos_weight=artefact_weight).to(device)
-        enc_params = freeze_non_encoder(self.model)
-        self.optimizer = torch.optim.AdamW(enc_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=max_epochs)
+
+        if tuning_strategy == "encoder_only":
+            params_to_optimize = freeze_non_encoder(self.model)
+            log.info("Strategy: Training ENCODER ONLY (Decoder frozen)")
+            
+        elif tuning_strategy == "full_model":
+            for param in self.model.parameters():
+                param.requires_grad = True
+            params_to_optimize = self.model.parameters()
+            log.info("Strategy: Training FULL MODEL (Encoder + Decoder)")
+            
+        else:
+            raise ValueError(f"Unknown tuning strategy: {tuning_strategy}")
+
+        self.optimizer = torch.optim.AdamW(params_to_optimize, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
+
+
+        if scheduler_type == "cosine":
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=max_epochs)
+        elif scheduler_type == "constant":
+            self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=9999, gamma=1.0)
+        else:
+            log.warning(f"Unknown scheduler type '{scheduler_type}', defaulting to cosine.")
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=max_epochs)
+
         self.max_epochs = max_epochs
         self.grad_clip = grad_clip
         self.amp = amp
@@ -360,6 +384,10 @@ class Trainer:
         best_f1 = 0.0
         patience_counter = 0
         
+        ckpt_dir = os.path.dirname(ckpt_path)
+        if ckpt_dir:
+            os.makedirs(ckpt_dir, exist_ok=True)
+
         ckpt_last = ckpt_path.replace('.pt', '_last.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_last.pt'
         ckpt_best = ckpt_path.replace('.pt', '_best.pt') if ckpt_path.endswith('.pt') else ckpt_path + '_best.pt'
         

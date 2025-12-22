@@ -20,7 +20,7 @@ def apply_unstructured_pruning(model: nn.Module, amount: float) -> None:
     """
     params_to_prune = []
     
-    for name, module in model.image_encoder.named_modules():
+    for name, module in model.named_modules():
         if isinstance(module, (nn.Conv2d, nn.Linear)):
             params_to_prune.append((module, 'weight'))
             
@@ -142,6 +142,7 @@ def main(cfg: DictConfig) -> None:
             device=cfg.system.device,
             epoch_offset=total_epochs,
             wandb_run=wandb_run,
+            tuning_strategy=cfg.train.tuning_strategy,
             patience=cfg.pruning.get("patience", 3)
         )
         
@@ -153,7 +154,8 @@ def main(cfg: DictConfig) -> None:
             wandb_run.log({
                 "pruning/fps": speed_stats["fps"],
                 "sparsity": current_sparsity,
-                "global_epoch": total_epochs
+                "global_epoch": total_epochs,
+                "model_params_millions": total_params / 1e6
             })
             
         total_epochs += ft_epochs
