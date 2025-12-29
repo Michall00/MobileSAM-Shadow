@@ -2,12 +2,17 @@ from __future__ import annotations
 import os
 import csv
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchao.quantization import (
+    quantize_, 
+    int8_dynamic_activation_int8_weight
+)
 import wandb
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
@@ -62,6 +67,66 @@ def finalize_metrics(tp: float, tn: float, fp: float, fn: float, shadow_tp: Opti
     return metrics
 
 
+def apply_quantization(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    amp_enabled: bool,
+    mode: str,
+    calib_batches: int,
+) -> Tuple[nn.Module, str, bool]:
+    mode_norm = mode.lower() if mode else "none"
+
+    size_before = get_model_size_mb(model)
+    log.info(f"[Quant] Initial model size: {size_before:.2f} MB")
+
+    if mode_norm in {"none", "fp32"}:
+        return model, device, amp_enabled
+
+    if mode_norm in {"fp16", "float16"}:
+        if "cuda" not in str(device):
+            log.warning("[Quant] FP16 requested but no CUDA. Falling back to FP32.")
+            return model, device, False
+        log.info("[Quant] Using FP16 Mixed Precision (AMP).")
+        return model, device, True
+
+    try:
+        if mode_norm == "int8_dynamic":
+            quantize_(model, int8_dynamic_activation_int8_weight())
+            log.info("[Quant] Applied INT8 Dynamic (torchao).")
+            
+        elif mode_norm == "int8_static":
+            quantize_(model, int8_dynamic_activation_int8_weight())
+            
+            log.info(f"[Quant] Calibrating INT8 static with {calib_batches} batches...")
+            model.eval()
+            with torch.no_grad():
+                for i, batch in enumerate(loader):
+                    if i >= calib_batches: break
+                    images = batch["image"].to(device)
+                    model.image_encoder(images)
+            log.info("[Quant] Calibration finished.")
+
+        size_after = get_model_size_mb(model)
+        log.info(f"[Quant] Post-quantization size: {size_after:.2f} MB (Reduction: {size_before/size_after:.1f}x)")
+        return model, device, False 
+
+    except Exception as exc:
+        log.error(f"[Quant] Quantization failed: {exc}. Using original model.")
+        return model, device, amp_enabled
+
+
+def get_model_size_mb(model: nn.Module) -> float:
+    """Returns the size of the model parameters in megabytes (MB).
+    """
+    total_size = 0
+    for p in model.parameters():
+        total_size += p.nelement() * p.element_size()
+    for b in model.buffers():
+        total_size += b.nelement() * b.element_size()
+    return total_size / (1024 * 1024)
+
+
 def save_panels_and_log(
     images: torch.Tensor,
     masks: torch.Tensor,
@@ -106,7 +171,8 @@ def save_predictions(
     vis_dir: str,
     vis_num: int,
     wandb_run: Optional[wandb.sdk.wandb_run.Run],
-    wandb_images: int
+    wandb_images: int,
+    amp_enabled: bool
 ) -> None:
     if not vis_dir:
         return
@@ -119,14 +185,16 @@ def save_predictions(
 
     with torch.no_grad():
         for b_idx, batch in enumerate(loader):
+
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
             points = [p.to(device) for p in batch["points"]]
             labels = [l.to(device) for l in batch["point_labels"]]
             boxes = [b.to(device) for b in batch["boxes"]]
-
-            logits = forward_mobile_sam(model, images, points, labels, boxes)
-            probs = torch.sigmoid(logits)
+            
+            with torch.amp.autocast(device, enabled=(amp_enabled and device == "cuda")):
+                logits = forward_mobile_sam(model, images, points, labels, boxes)
+                probs = torch.sigmoid(logits)
 
             for i in tqdm(range(images.size(0))):
                 img_np = sam_denormalize(images[i])
@@ -195,9 +263,15 @@ def main(cfg: DictConfig) -> None:
         object_masks_dir=cfg.data.obj_masks_dir,
         size=cfg.data.size,
         batch_size=cfg.data.batch_size,
-        val_split=0.0,  # No validation split for testing
+        val_split=0.0,
         num_workers=cfg.system.num_workers,
         seed=cfg.system.seed,
+    )
+
+    quant_mode = getattr(cfg.test, "quantization", "none")
+    calib_batches = int(getattr(cfg.test, "quant_calib_batches", 8))
+    model, device, amp_enabled = apply_quantization(
+        model, loader, device, amp_enabled, quant_mode, calib_batches
     )
 
     wb = None
@@ -275,7 +349,16 @@ def main(cfg: DictConfig) -> None:
             "test/recall": global_metrics["recall"],
             "test/shadow_iou": global_metrics.get("shadow_iou", float("nan"))
         })
-        save_predictions(model, loader, device, getattr(cfg.test, "vis_dir", None), getattr(cfg.test, "vis_num", 0), wb, cfg.wandb.wandb_images_num)
+        save_predictions(
+            model,
+            loader,
+            device,
+            getattr(cfg.test, "vis_dir", None),
+            getattr(cfg.test, "vis_num", 0),
+            wb,
+            cfg.wandb.wandb_images_num,
+            amp_enabled,
+        )
 
         wb.finish()
 

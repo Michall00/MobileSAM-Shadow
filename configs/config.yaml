@@ -65,6 +65,8 @@ test:
   vis_dir: "predictions_debug"
   vis_num: 20
   vis_every: 5
+  quantization: "none" # none | fp16 | int8_dynamic | int8_static
+  quant_calib_batches: 8
 
 wandb:
   enabled: true
