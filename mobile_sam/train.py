@@ -66,7 +66,9 @@ def main(cfg: DictConfig) -> None:
         vis_num=cfg.test.vis_num,
         wandb_run=wandb_run,
         wandb_images=cfg.wandb.wandb_images_num,
-        artefact_weight=cfg.train.artefact_loss_weight
+        tuning_strategy=cfg.train.tuning_strategy,
+        qat_enabled=cfg.train.qat_enabled,
+        qat_type=cfg.train.qat_type,
     )
 
     if cfg.train.resume_ckpt:

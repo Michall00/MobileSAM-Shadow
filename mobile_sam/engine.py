@@ -18,6 +18,13 @@ from tqdm import tqdm
 import math
 import time
 
+from torchao.quantization.qat import (
+    QATConfig
+)
+from torchao.quantization import Int8DynamicActivationInt4WeightConfig
+from torchao.quantization.quant_api import quantize_
+
+
 log = get_logger(__name__)
 
 class ArtefactLoss(nn.Module):
@@ -55,12 +62,26 @@ class Trainer:
         custom_sparsity: float | None = None,
         artefact_weight: float = 1.0,
         scheduler_type: str = "cosine",
-        tuning_strategy: Literal["encoder_only", "full_model"] = "encoder_only"
+        tuning_strategy: Literal["encoder_only", "full_model"] = "encoder_only",
+        qat_enabled: bool = False,
+        qat_type: str = "int8_dyn_act_int4_weight",
     ) -> None:
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.loss_fn = ArtefactLoss(pos_weight=artefact_weight).to(device)
+        self.device = device
+        
+        self.qat_enabled = qat_enabled
+
+        if self.qat_enabled:
+            log.info("Preparing model for Int8 Weight + Int8 Activation QAT")
+            
+            self.base_config = Int8DynamicActivationInt4WeightConfig(group_size=32)
+            qat_config = QATConfig(self.base_config, step="prepare")
+            self.model.to("cpu")
+            quantize_(self.model, qat_config)
+            self.model.to(self.device)
 
         if tuning_strategy == "encoder_only":
             params_to_optimize = freeze_non_encoder(self.model)
@@ -89,7 +110,6 @@ class Trainer:
         self.max_epochs = max_epochs
         self.grad_clip = grad_clip
         self.amp = amp
-        self.device = device
         self.epoch_offset = epoch_offset
         self.patience = patience
         
@@ -173,6 +193,15 @@ class Trainer:
 
         log.info(f"Vis: Saved {saved} images to {out_dir}")
         self.model.train()
+        
+    def log_qat_stats(self, epoch: int):
+        stats = {}
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'weight_fake_quant'):
+                stats[f"qat/scale_{name}"] = module.weight_fake_quant.scale.mean().item()
+                
+        if self.wandb:
+            self.wandb.log(stats, step=epoch)
             
     def baseline_evaluation(self) -> None:
         log.info(f"[Baseline Eval] Starting evaluation (Global Epoch: {self.epoch_offset})...")
@@ -432,6 +461,16 @@ class Trainer:
                 if patience_counter >= self.patience:
                     log.info(f"Early Stopping triggered after {epoch} epochs (No improvement for {self.patience} epochs).")
                     break
+                
+        if self.qat_enabled:
+            log.info("Converting QAT model to real Int8 quantized format...")
+            
+            self.model.to("cpu")
+            quantize_(self.model, QATConfig(self.base_config, step="convert"))
+            self.model.to(self.device)
+            
+            torch.save(self.model.state_dict(), ckpt_path.replace(".pt", "_int8_final.pt"))
+            
 
     def save_checkpoint(self, path: str) -> None:
         state = {

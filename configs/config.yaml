@@ -8,7 +8,7 @@ system:
 
 data:
   size: 1024
-  batch_size: 4
+  batch_size: 1
   augment: false
   aug_params:
     prob: 0.5
@@ -20,20 +20,20 @@ data:
     noise: false
 
   reflection:
-    root_dir: "data/DEROBA_test2"
-    images_dir: "${data.reflection.root_dir}/images"
-    masks_dir: "${data.reflection.root_dir}/masks"
-    obj_masks_dir: "${data.reflection.root_dir}/object_masks"
+    root_dir: "C:\\Users\\msado\\Studia\\MobileSAM\\MobileSAM-Shadow\\data\\DEROBA_test2"
+    images_dir: "${data.reflection.root_dir}\\images"
+    masks_dir: "${data.reflection.root_dir}\\masks"
+    obj_masks_dir: "${data.reflection.root_dir}\\object_masks"
   shadow:
-    root_dir: "data/prepared_soba"
-    images_dir: "${data.shadow.root_dir}/images_test"
-    masks_dir: "${data.shadow.root_dir}/masks_test"
-    obj_masks_dir: "${data.shadow.root_dir}/object_masks_test"
+    root_dir: "C:\\Users\\msado\\Studia\\MobileSAM\\MobileSAM-Shadow\\data\\prepared_soba"
+    images_dir: "${data.shadow.root_dir}\\images_test"
+    masks_dir: "${data.shadow.root_dir}\\masks_test"
+    obj_masks_dir: "${data.shadow.root_dir}\\object_masks_test"
   normal:
-    root_dir: "data/DEROBA_test2"
-    images_dir: "${data.normal.root_dir}/images_without_reflection"
-    masks_dir: "${data.normal.root_dir}/object_masks"
-    obj_masks_dir: "${data.normal.root_dir}/object_masks"
+    root_dir: "C:\\Users\\msado\\Studia\\MobileSAM\\MobileSAM-Shadow\\data\\DEROBA_test2"
+    images_dir: "${data.normal.root_dir}\\images_without_reflection"
+    masks_dir: "${data.normal.root_dir}\\object_masks"
+    obj_masks_dir: "${data.normal.root_dir}\\object_masks"
 
 model:
   type: "vit_t"
@@ -50,16 +50,19 @@ pruning:
   amount_per_iter: 0.1
 
 train:
-  epochs: 10
+  epochs: 5
   lr: 1e-4
   weight_decay: 5e-2
   grad_clip: 1.0
-  amp: true
+  amp: false
   val_split: 0.1
   patience: 3
-  resume_ckpt: "weights/mobilesam_base_best.pt"
+  resume_ckpt: ""
   output_ckpt: "weights/mobilesam_base.pt"
   artefact_loss_weight: 3.0
+  tuning_strategy: full_model
+  qat_enabled: true
+  qat_type: int8_dyn_act_int4_weight
 
 test:
   vis_dir: "predictions_debug"
@@ -70,8 +73,8 @@ test:
 
 wandb:
   enabled: true
-  project: "mobilesam-pruning-experiments"
+  project: "mobilesam-QAT-test"
   entity: null
   mode: "online"
   wandb_images_num: 50
-  run_name: "run_${now:%Y-%m-%d_%H-%M-%S}"
+  run_name: "run_${now:%Y-%m-%d_%H-%M-%S}_${test.quantization}"
