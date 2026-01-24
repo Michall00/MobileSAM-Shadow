@@ -103,19 +103,18 @@ source .venv/bin/activate
 uv sync
 ```
 
-## Training and Fine-Tuning
+## Training Overview
 
-Fine-tuning was performed on artifact-augmented datasets using the
-original MobileSAM training pipeline, with modified supervision
-targets that include artifact regions.
-
-No architectural changes were introduced.
+The training process consists of:
+1. dataset preparation with artifact-aware masks
+2. fine-tuning MobileSAM 
+3. optional model optimization (pruning / QAT)
+4. export to ONNX for downstream deployment
 
 ## Model Optimization (Pruning and Quantization)
 
-As part of the research conducted in the associated engineering thesis,
-the fine-tuned MobileSAM models were further optimized for mobile
-deployment using:
+As part of the research the fine-tuned MobileSAM models 
+were further optimized for mobile deployment using:
 
 - structured and unstructured weight pruning
 - quantization-aware training (QAT)
@@ -123,23 +122,6 @@ deployment using:
 These techniques were applied to reduce model size and inference cost
 while preserving segmentation quality, particularly in artifact-aware
 scenarios.
-
-## Training Overview
-
-Model fine-tuning follows the original MobileSAM training pipeline,
-with modifications limited to the supervision targets to include
-artifact regions (shadows and reflections).
-
-The training process consists of:
-1. dataset preparation with artifact-aware masks
-2. fine-tuning using the original MobileSAM training scripts
-3. optional model optimization (pruning / QAT)
-4. export to ONNX for downstream deployment
-
-This repository is not intended to provide a full end-to-end training
-tutorial. Users interested in reproducing the experiments should refer
-to the original MobileSAM documentation and adapt the provided data
-preparation scripts.
 
 ## Configuration
 
@@ -151,7 +133,9 @@ The configuration mechanism allows adjusting, among others:
 - dataset paths and preprocessing options
 - training and fine-tuning settings
 - optimization flags (e.g. pruning, quantization)
-- expo
+- export and deployment parameters
+
+example of a config can be found here: `configs/config.yaml`
 
 ## ONNX Export
 
