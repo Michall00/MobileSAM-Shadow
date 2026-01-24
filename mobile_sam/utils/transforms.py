@@ -4,13 +4,12 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from copy import deepcopy
+
 import numpy as np
 import torch
 from torch.nn import functional as F
 from torchvision.transforms.functional import resize, to_pil_image  # type: ignore
-
-from copy import deepcopy
-from typing import Tuple
 
 
 class ResizeLongestSide:
@@ -30,7 +29,7 @@ class ResizeLongestSide:
         target_size = self.get_preprocess_shape(image.shape[0], image.shape[1], self.target_length)
         return np.array(resize(to_pil_image(image), target_size))
 
-    def apply_coords(self, coords: np.ndarray, original_size: Tuple[int, ...]) -> np.ndarray:
+    def apply_coords(self, coords: np.ndarray, original_size: tuple[int, ...]) -> np.ndarray:
         """
         Expects a numpy array of length 2 in the final dimension. Requires the
         original image size in (H, W) format.
@@ -44,7 +43,7 @@ class ResizeLongestSide:
         coords[..., 1] = coords[..., 1] * (new_h / old_h)
         return coords
 
-    def apply_boxes(self, boxes: np.ndarray, original_size: Tuple[int, ...]) -> np.ndarray:
+    def apply_boxes(self, boxes: np.ndarray, original_size: tuple[int, ...]) -> np.ndarray:
         """
         Expects a numpy array shape Bx4. Requires the original image size
         in (H, W) format.
@@ -65,7 +64,7 @@ class ResizeLongestSide:
         )
 
     def apply_coords_torch(
-        self, coords: torch.Tensor, original_size: Tuple[int, ...]
+        self, coords: torch.Tensor, original_size: tuple[int, ...]
     ) -> torch.Tensor:
         """
         Expects a torch tensor with length 2 in the last dimension. Requires the
@@ -81,7 +80,7 @@ class ResizeLongestSide:
         return coords
 
     def apply_boxes_torch(
-        self, boxes: torch.Tensor, original_size: Tuple[int, ...]
+        self, boxes: torch.Tensor, original_size: tuple[int, ...]
     ) -> torch.Tensor:
         """
         Expects a torch tensor with shape Bx4. Requires the original image
@@ -91,7 +90,7 @@ class ResizeLongestSide:
         return boxes.reshape(-1, 4)
 
     @staticmethod
-    def get_preprocess_shape(oldh: int, oldw: int, long_side_length: int) -> Tuple[int, int]:
+    def get_preprocess_shape(oldh: int, oldw: int, long_side_length: int) -> tuple[int, int]:
         """
         Compute the output size given input size and target long side length.
         """

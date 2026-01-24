@@ -4,16 +4,16 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Any
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from typing import Any, Dict, List, Tuple, Union
-
-from .tiny_vit_sam import TinyViT
 from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
+from .tiny_vit_sam import TinyViT
 
 
 class Sam(nn.Module):
@@ -22,11 +22,11 @@ class Sam(nn.Module):
 
     def __init__(
         self,
-        image_encoder: Union[ImageEncoderViT, TinyViT],
+        image_encoder: ImageEncoderViT | TinyViT,
         prompt_encoder: PromptEncoder,
         mask_decoder: MaskDecoder,
-        pixel_mean: List[float] = [123.675, 116.28, 103.53],
-        pixel_std: List[float] = [58.395, 57.12, 57.375],
+        pixel_mean: list[float] = [123.675, 116.28, 103.53],
+        pixel_std: list[float] = [58.395, 57.12, 57.375],
     ) -> None:
         """
         SAM predicts object masks from an image and input prompts.
@@ -54,9 +54,9 @@ class Sam(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        batched_input: List[Dict[str, Any]],
+        batched_input: list[dict[str, Any]],
         multimask_output: bool,
-    ) -> List[Dict[str, torch.Tensor]]:
+    ) -> list[dict[str, torch.Tensor]]:
         """
         Predicts masks end-to-end from provided images and prompts.
         If prompts are not known in advance, using SamPredictor is
@@ -134,8 +134,8 @@ class Sam(nn.Module):
     def postprocess_masks(
         self,
         masks: torch.Tensor,
-        input_size: Tuple[int, ...],
-        original_size: Tuple[int, ...],
+        input_size: tuple[int, ...],
+        original_size: tuple[int, ...],
     ) -> torch.Tensor:
         """
         Remove padding and upscale masks to the original image size.

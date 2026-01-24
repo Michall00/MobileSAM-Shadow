@@ -1,19 +1,22 @@
-
 import argparse
 import json
-import random
 import logging
+import random
 from pathlib import Path
-from PIL import Image
+
 import numpy as np
-from lvis import LVIS
 import requests
+from lvis import LVIS
+from PIL import Image
+
 
 def extract_instance_lvis(lvis, img_root, img_info, ann):
     file_name = img_info["coco_url"].split("/")[-1]
     img_path = img_root / file_name
     if not img_path.exists():
-        logging.warning(f"Image not found locally: {img_path}, downloading from {img_info['coco_url']}")
+        logging.warning(
+            f"Image not found locally: {img_path}, downloading from {img_info['coco_url']}"
+        )
         try:
             response = requests.get(img_info["coco_url"], timeout=10)
             response.raise_for_status()
@@ -31,6 +34,7 @@ def extract_instance_lvis(lvis, img_root, img_info, ann):
     crop_mask = mask.crop((x, y, x + w, y + h))
     return crop_img, crop_mask, int(ann["category_id"])
 
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser("LVIS object cutout and paste")
@@ -39,7 +43,13 @@ def main():
     parser.add_argument("--bg-root", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--n", type=int, default=500)
-    parser.add_argument("--allowed-category-ids", type=int, nargs="*", default=None, help="List of allowed category_ids")
+    parser.add_argument(
+        "--allowed-category-ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help="List of allowed category_ids",
+    )
     parser.add_argument("--min-mask-area", type=int, default=0, help="Minimal mask area in pixels")
     args = parser.parse_args()
 
@@ -53,7 +63,9 @@ def main():
         anns_by_img.setdefault(img_id, []).append(ann)
     logging.info(f"Found {len(anns_by_img)} images with annotations.")
 
-    bg_paths = [p for p in args.bg_root.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+    bg_paths = [
+        p for p in args.bg_root.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    ]
     logging.info(f"Found {len(bg_paths)} background images.")
     (args.out_root / "images").mkdir(parents=True, exist_ok=True)
     (args.out_root / "masks").mkdir(parents=True, exist_ok=True)
@@ -74,7 +86,9 @@ def main():
             anns = anns_by_img[img_id]
             ann = random.choice(anns)
             try:
-                obj_img, obj_mask, cat_id = extract_instance_lvis(lvis, args.img_root, img_info, ann)
+                obj_img, obj_mask, cat_id = extract_instance_lvis(
+                    lvis, args.img_root, img_info, ann
+                )
             except Exception as e:
                 logging.warning(f"Failed to extract instance: {e}. img_info: {img_info}")
                 continue
@@ -110,8 +124,8 @@ def main():
             try:
                 pasted.save(args.out_root / "images" / img_name)
                 obj_mask.save(args.out_root / "masks" / mask_name)
-                cutout = Image.new("RGBA", target_size, (0,0,0,0))
-                cutout.paste(obj_img, (0,0), obj_mask)
+                cutout = Image.new("RGBA", target_size, (0, 0, 0, 0))
+                cutout.paste(obj_img, (0, 0), obj_mask)
                 cutout.save(args.out_root / "cutouts" / cutout_name)
             except Exception as e:
                 logging.warning(f"Failed to save images for sample {saved}: {e}")
@@ -130,6 +144,7 @@ def main():
             if saved % 10 == 0:
                 logging.info(f"Saved {saved}/{args.n} samples.")
     logging.info(f"Done. Saved {saved} samples.")
+
 
 if __name__ == "__main__":
     main()

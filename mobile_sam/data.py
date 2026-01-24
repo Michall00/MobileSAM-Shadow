@@ -3,6 +3,7 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import ConcatDataset, DataLoader, random_split
 
+from mobile_sam.common import get_logger
 from mobile_sam.utils.dataset_utils import (
     TASK_NORMAL,
     TASK_REFLECTION,
@@ -11,8 +12,6 @@ from mobile_sam.utils.dataset_utils import (
 )
 from mobile_sam.utils.obj_prompt_reflection_dataset import ObjPromptReflectionDataset
 from mobile_sam.utils.obj_prompt_shadow_dataset import ObjPromptShadowDataset
-from mobile_sam.common import get_logger
-
 
 log = get_logger(__name__)
 
@@ -22,11 +21,10 @@ def build_dataloaders(
     val_split: float,
     num_workers: int,
     seed: int,
-    augmenter: A.Compose | None = None
+    augmenter: A.Compose | None = None,
 ) -> tuple[DataLoader, DataLoader | None]:
-    
     datasets = []
-    
+
     if cfg_data.get("shadow", None):
         log.info("Initializing Shadow Dataset...")
         ds_shadow = ObjPromptShadowDataset(
@@ -36,8 +34,7 @@ def build_dataloaders(
             size=cfg_data.size,
             seed=seed,
             return_obj_mask=True,
-            augmenter=augmenter
-            # task_id=TASK_SHADOW
+            augmenter=augmenter,
         )
         datasets.append(ds_shadow)
 
@@ -51,10 +48,10 @@ def build_dataloaders(
             seed=seed,
             return_obj_mask=True,
             augmenter=augmenter,
-            task_id=TASK_REFLECTION
+            task_id=TASK_REFLECTION,
         )
         datasets.append(ds_refl)
-        
+
     if cfg_data.get("normal", None):
         log.info("Initializing Normal Dataset...")
         ds_normal = ObjPromptReflectionDataset(
@@ -65,7 +62,7 @@ def build_dataloaders(
             seed=seed,
             return_obj_mask=False,
             augmenter=augmenter,
-            task_id=TASK_NORMAL
+            task_id=TASK_NORMAL,
         )
         datasets.append(ds_normal)
 
@@ -79,17 +76,35 @@ def build_dataloaders(
         full_ds = datasets[0]
 
     if val_split <= 0.0:
-        return DataLoader(full_ds, batch_size=cfg_data.batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate), None
-    
+        return DataLoader(
+            full_ds,
+            batch_size=cfg_data.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=two_mask_collate,
+        ), None
+
     val_len = int(len(full_ds) * val_split)
     train_len = len(full_ds) - val_len
-    
+
     g = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(full_ds, [train_len, val_len], generator=g)
-    
+
     log.info(f"Combined Data: Train={len(train_ds)}, Val={len(val_ds)}")
-    
-    train_loader = DataLoader(train_ds, batch_size=cfg_data.batch_size, shuffle=True, num_workers=num_workers, collate_fn=two_mask_collate)
-    val_loader = DataLoader(val_ds, batch_size=cfg_data.batch_size, shuffle=False, num_workers=num_workers, collate_fn=two_mask_collate)
-    
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg_data.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=two_mask_collate,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg_data.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=two_mask_collate,
+    )
+
     return train_loader, val_loader

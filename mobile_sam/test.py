@@ -1,48 +1,40 @@
 from __future__ import annotations
-import os
-import csv
+
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import Any
 
 import hydra
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchao.quantization import (
-    quantize_, 
-    int8_dynamic_activation_int8_weight
-)
-import wandb
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
 from PIL import ImageDraw
 from rich.logging import RichHandler
 from torch.utils.data import DataLoader
+from torchao.quantization import int8_dynamic_activation_int8_weight, quantize_
 from tqdm import tqdm
 
+import wandb
 from mobile_sam.train import build_dataloaders, load_mobilesam_vit_t, set_seed
-from mobile_sam.utils.common import make_panel, sam_denormalize
+from mobile_sam.utils.common import make_panel, sam_denormalize_float
 from mobile_sam.utils.eval import forward_mobile_sam
-from mobile_sam.utils.shadow_metrics import compute_shadow_iou, compute_shadow_tp_union
-
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[
-        RichHandler(
-            rich_tracebacks=True,
-            show_time=True,
-            show_path=False
-        )
-    ]
+    handlers=[RichHandler(rich_tracebacks=True, show_time=True, show_path=False)],
 )
 
 log = logging.getLogger(__name__)
 
-def compute_counts(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5) -> Dict[str, float]:
+
+def compute_counts(
+    logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5
+) -> dict[str, float]:
     probs = torch.sigmoid(logits)
     pred = (probs >= thr).float()
     tp = (pred * target).sum().item()
@@ -52,7 +44,14 @@ def compute_counts(logits: torch.Tensor, target: torch.Tensor, thr: float = 0.5)
     return {"tp": tp, "tn": tn, "fp": fp, "fn": fn}
 
 
-def finalize_metrics(tp: float, tn: float, fp: float, fn: float, shadow_tp: Optional[float] = None, shadow_union: Optional[float] = None) -> Dict[str, float]:
+def finalize_metrics(
+    tp: float,
+    tn: float,
+    fp: float,
+    fn: float,
+    shadow_tp: float | None = None,
+    shadow_union: float | None = None,
+) -> dict[str, float]:
     iou = tp / max(1.0, (tp + fp + fn))
     prec = tp / max(1.0, (tp + fp))
     rec = tp / max(1.0, (tp + fn))
@@ -74,7 +73,7 @@ def apply_quantization(
     amp_enabled: bool,
     mode: str,
     calib_batches: int,
-) -> Tuple[nn.Module, str, bool]:
+) -> tuple[nn.Module, str, bool]:
     mode_norm = mode.lower() if mode else "none"
 
     size_before = get_model_size_mb(model)
@@ -94,22 +93,25 @@ def apply_quantization(
         if mode_norm == "int8_dynamic":
             quantize_(model, int8_dynamic_activation_int8_weight())
             log.info("[Quant] Applied INT8 Dynamic (torchao).")
-            
+
         elif mode_norm == "int8_static":
             quantize_(model, int8_dynamic_activation_int8_weight())
-            
+
             log.info(f"[Quant] Calibrating INT8 static with {calib_batches} batches...")
             model.eval()
             with torch.no_grad():
                 for i, batch in enumerate(loader):
-                    if i >= calib_batches: break
+                    if i >= calib_batches:
+                        break
                     images = batch["image"].to(device)
                     model.image_encoder(images)
             log.info("[Quant] Calibration finished.")
 
         size_after = get_model_size_mb(model)
-        log.info(f"[Quant] Post-quantization size: {size_after:.2f} MB (Reduction: {size_before/size_after:.1f}x)")
-        return model, device, False 
+        log.info(
+            f"[Quant] Post-quantization size: {size_after:.2f} MB (Reduction: {size_before / size_after:.1f}x)"
+        )
+        return model, device, False
 
     except Exception as exc:
         log.error(f"[Quant] Quantization failed: {exc}. Using original model.")
@@ -117,8 +119,7 @@ def apply_quantization(
 
 
 def get_model_size_mb(model: nn.Module) -> float:
-    """Returns the size of the model parameters in megabytes (MB).
-    """
+    """Returns the size of the model parameters in megabytes (MB)."""
     total_size = 0
     for p in model.parameters():
         total_size += p.nelement() * p.element_size()
@@ -133,16 +134,16 @@ def save_panels_and_log(
     probs: torch.Tensor,
     out_dir: str,
     batch_idx: int,
-    wb: Optional[wandb.sdk.wandb_run.Run],
+    wb: wandb.sdk.wandb_run.Run | None,
     wb_limit: int,
     saved_total: int,
-    boxes: List[torch.Tensor]
+    boxes: list[torch.Tensor],
 ) -> int:
     os.makedirs(out_dir, exist_ok=True)
-    wb_imgs: List[Any] = []
+    wb_imgs: list[Any] = []
     B = images.size(0)
     for i in range(B):
-        img_np = sam_denormalize(images[i])
+        img_np = sam_denormalize_float(images[i])
         gt = (masks[i, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
         pr = (probs[i, 0].detach().cpu().numpy() >= 0.5).astype(np.uint8)
         panel = make_panel(img_np, gt, pr)
@@ -170,9 +171,9 @@ def save_predictions(
     device: str,
     vis_dir: str,
     vis_num: int,
-    wandb_run: Optional[wandb.sdk.wandb_run.Run],
+    wandb_run: wandb.sdk.wandb_run.Run | None,
     wandb_images: int,
-    amp_enabled: bool
+    amp_enabled: bool,
 ) -> None:
     if not vis_dir:
         return
@@ -181,23 +182,22 @@ def save_predictions(
 
     model.eval()
     saved = 0
-    wb_imgs: List[Any] = []
+    wb_imgs: list[Any] = []
 
     with torch.no_grad():
         for b_idx, batch in enumerate(loader):
-
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
             points = [p.to(device) for p in batch["points"]]
             labels = [l.to(device) for l in batch["point_labels"]]
             boxes = [b.to(device) for b in batch["boxes"]]
-            
+
             with torch.amp.autocast(device, enabled=(amp_enabled and device == "cuda")):
                 logits = forward_mobile_sam(model, images, points, labels, boxes)
                 probs = torch.sigmoid(logits)
 
             for i in tqdm(range(images.size(0))):
-                img_np = sam_denormalize(images[i])
+                img_np = sam_denormalize_float(images[i])
                 gt_np = masks[i, 0].cpu().numpy() > 0.5
                 pred_np = probs[i, 0].cpu().numpy() > 0.5
 
@@ -234,28 +234,15 @@ def main(cfg: DictConfig) -> None:
 
     device = cfg.system.device
     amp_enabled = getattr(cfg.train, "amp", True)
-    thr = getattr(cfg.test, "thr", 0.5)
 
     model = load_mobilesam_vit_t(None, device=device)
 
-    if getattr(cfg.test, "ckpt_path", None):
-        ckpt = cfg.test.ckpt_path
-        log.info(f"[INFO] Loading checkpoint from {ckpt}")
-        state = torch.load(ckpt, map_location=device)
-        if isinstance(state, dict):
-            if "model" in state:
-                state = state["model"]
-            model.load_state_dict(state, strict=False)
-        else:
-            log.error(f"[ERROR] Checkpoint format not recognized.")
-            return
-    elif getattr(cfg.model, "pretrained_path", None):
-        pre = cfg.model.pretrained_path
-        log.info(f"[INFO] Loading pretrained weights from {pre}")
-        state = torch.load(pre, map_location=device)
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        model.load_state_dict(state, strict=False)
+    pre = cfg.model.pretrained_path
+    log.info(f"[INFO] Loading pretrained weights from {pre}")
+    state = torch.load(pre, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state, strict=False)
 
     loader, _ = build_dataloaders(
         images_dir=cfg.data.images_dir,
@@ -287,68 +274,31 @@ def main(cfg: DictConfig) -> None:
 
     total_tp = total_tn = total_fp = total_fn = 0.0
     shadow_tp_total, shadow_union_total = 0.0, 0.0
-    saved = 0
 
-    save_csv = getattr(cfg.test, "save_csv", None)
-
-    if save_csv:
-        with open(save_csv, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["batch_idx", "precision", "recall", "f1", "iou", "ber", "shadow_iou"])
-
-            with torch.no_grad():
-                for b_idx, batch in enumerate(tqdm(loader)):
-                    images = batch["image"].to(device, non_blocking=True)
-                    masks = batch["mask"].to(device, non_blocking=True)
-                    points = [p.to(device) for p in batch["points"]]
-                    labels = [l.to(device) for l in batch["point_labels"]]
-                    boxes = [b.to(device) for b in batch["boxes"]]
-                    obj_mask = batch.get("obj_mask")
-                    if obj_mask is not None:
-                        obj_mask = obj_mask.to(device, non_blocking=True)
-
-                    with torch.amp.autocast(device, enabled=(amp_enabled and device == "cuda")):
-                        logits = forward_mobile_sam(model, images, points, labels, boxes)
-                        probs = torch.sigmoid(logits)
-
-                    counts = compute_counts(logits, masks, thr=thr)
-                    total_tp += counts["tp"]; total_tn += counts["tn"]; total_fp += counts["fp"]; total_fn += counts["fn"]
-
-                    shadow_tp = shadow_union = None
-                    shadow_iou = None
-                    if obj_mask is not None:
-                        shadow_tp, shadow_union = compute_shadow_tp_union(probs, masks, obj_mask, thr)
-                        shadow_iou = compute_shadow_iou(probs, masks, obj_mask, thr).item()
-                        shadow_tp_total += shadow_tp
-                        shadow_union_total += shadow_union
-
-                    m = finalize_metrics(counts["tp"], counts["tn"], counts["fp"], counts["fn"], shadow_tp, shadow_union)
-                    m["shadow_iou"] = shadow_iou if shadow_iou is not None else float("nan")
-                    writer.writerow([b_idx, m["precision"], m["recall"], m["f1"], m["iou"], m["ber"], m.get("shadow_iou", float("nan"))])
-
-                    vis_dir = getattr(cfg.test, "vis_dir", None)
-                    vis_num = getattr(cfg.test, "vis_num", -1)
-                    if vis_dir and (vis_num < 0 or saved < vis_num):
-                        saved = save_panels_and_log(
-                            images, masks, probs, vis_dir, b_idx, wb, cfg.wandb.wandb_images_num, saved, boxes
-                        )
-
-    global_metrics = finalize_metrics(total_tp, total_tn, total_fp, total_fn, shadow_tp_total, shadow_union_total)
+    global_metrics = finalize_metrics(
+        total_tp, total_tn, total_fp, total_fn, shadow_tp_total, shadow_union_total
+    )
     log.info(
         "[TEST] IoU=%.4f F1=%.4f BER=%.4f Precision=%.4f Recall=%.4f Shadow IoU=%.4f",
-        global_metrics['iou'], global_metrics['f1'], global_metrics['ber'],
-        global_metrics['precision'], global_metrics['recall'], global_metrics.get('shadow_iou', float('nan'))
+        global_metrics["iou"],
+        global_metrics["f1"],
+        global_metrics["ber"],
+        global_metrics["precision"],
+        global_metrics["recall"],
+        global_metrics.get("shadow_iou", float("nan")),
     )
 
     if wb:
-        wb.log({
-            "test/iou": global_metrics["iou"],
-            "test/f1": global_metrics["f1"],
-            "test/ber": global_metrics["ber"],
-            "test/precision": global_metrics["precision"],
-            "test/recall": global_metrics["recall"],
-            "test/shadow_iou": global_metrics.get("shadow_iou", float("nan"))
-        })
+        wb.log(
+            {
+                "test/iou": global_metrics["iou"],
+                "test/f1": global_metrics["f1"],
+                "test/ber": global_metrics["ber"],
+                "test/precision": global_metrics["precision"],
+                "test/recall": global_metrics["recall"],
+                "test/shadow_iou": global_metrics.get("shadow_iou", float("nan")),
+            }
+        )
         save_predictions(
             model,
             loader,

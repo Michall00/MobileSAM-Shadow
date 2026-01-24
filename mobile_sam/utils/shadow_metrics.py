@@ -1,5 +1,4 @@
 import torch
-from typing import Tuple
 
 
 def _shadow_masks(
@@ -7,7 +6,7 @@ def _shadow_masks(
     gt_mask: torch.Tensor,
     obj_mask: torch.Tensor,
     threshold: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (pred_shadow, gt_shadow) boolean masks with objects removed."""
     pred = probs >= threshold
     non_obj = ~obj_mask.bool()
@@ -21,7 +20,7 @@ def compute_shadow_tp_union(
     gt_mask: torch.Tensor,
     obj_mask: torch.Tensor,
     threshold: float = 0.5,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """
     Returns (TP, Union) for shadow IoU.
     Assumes `probs` are shadow probabilities. If you pass logits, apply sigmoid first.

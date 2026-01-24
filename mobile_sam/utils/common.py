@@ -1,8 +1,8 @@
-from typing import Tuple
+from typing import tuple
+
 import numpy as np
-from PIL import Image, ImageDraw
 import torch
-import torch.nn.functional as F
+from PIL import Image, ImageDraw
 
 
 def sam_denormalize_float(img_t: torch.Tensor) -> np.ndarray:
@@ -14,11 +14,15 @@ def sam_denormalize_float(img_t: torch.Tensor) -> np.ndarray:
     return x
 
 
-def color_overlay(img: np.ndarray, mask: np.ndarray, color: Tuple[int, int, int], alpha: float = 0.45) -> np.ndarray:
+def color_overlay(
+    img: np.ndarray, mask: np.ndarray, color: tuple[int, int, int], alpha: float = 0.45
+) -> np.ndarray:
     out = img.copy()
     overlay = np.zeros_like(out, dtype=np.uint8)
     overlay[mask.astype(bool)] = color
-    out = (out.astype(np.float32) * (1 - alpha) + overlay.astype(np.float32) * alpha).astype(np.uint8)
+    out = (out.astype(np.float32) * (1 - alpha) + overlay.astype(np.float32) * alpha).astype(
+        np.uint8
+    )
     return out
 
 
@@ -34,7 +38,9 @@ def make_panel(img: np.ndarray, gt: np.ndarray, pred: np.ndarray) -> Image.Image
     return canvas
 
 
-def make_panel_with_points(img: np.ndarray, gt: np.ndarray, pred: np.ndarray, points: np.ndarray) -> Image.Image:
+def make_panel_with_points(
+    img: np.ndarray, gt: np.ndarray, pred: np.ndarray, points: np.ndarray
+) -> Image.Image:
     panel = make_panel(img, gt, pred)
     w, h = img.shape[1], img.shape[0]
     draw = ImageDraw.Draw(panel)
@@ -43,5 +49,7 @@ def make_panel_with_points(img: np.ndarray, gt: np.ndarray, pred: np.ndarray, po
         for offset in [0, w, 2 * w]:
             x, y = px + offset, py
             r = 7
-            draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 0), outline=(0, 0, 0), width=2)
+            draw.ellipse(
+                (x - r, y - r, x + r, y + r), fill=(255, 255, 0), outline=(0, 0, 0), width=2
+            )
     return panel

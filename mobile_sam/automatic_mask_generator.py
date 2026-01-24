@@ -4,11 +4,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Any
+
 import numpy as np
 import torch
 from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
-
-from typing import Any, Dict, List, Optional, Tuple
 
 from .modeling import Sam
 from .predictor import SamPredictor
@@ -36,7 +36,7 @@ class SamAutomaticMaskGenerator:
     def __init__(
         self,
         model: Sam,
-        points_per_side: Optional[int] = 32,
+        points_per_side: int | None = 32,
         points_per_batch: int = 64,
         pred_iou_thresh: float = 0.88,
         stability_score_thresh: float = 0.95,
@@ -46,7 +46,7 @@ class SamAutomaticMaskGenerator:
         crop_nms_thresh: float = 0.7,
         crop_overlap_ratio: float = 512 / 1500,
         crop_n_points_downscale_factor: int = 1,
-        point_grids: Optional[List[np.ndarray]] = None,
+        point_grids: list[np.ndarray] | None = None,
         min_mask_region_area: int = 0,
         output_mode: str = "binary_mask",
     ) -> None:
@@ -95,9 +95,9 @@ class SamAutomaticMaskGenerator:
             memory.
         """
 
-        assert (points_per_side is None) != (
-            point_grids is None
-        ), "Exactly one of points_per_side or point_grid must be provided."
+        assert (points_per_side is None) != (point_grids is None), (
+            "Exactly one of points_per_side or point_grid must be provided."
+        )
         if points_per_side is not None:
             self.point_grids = build_all_layer_point_grids(
                 points_per_side,
@@ -115,10 +115,10 @@ class SamAutomaticMaskGenerator:
             "coco_rle",
         ], f"Unknown output_mode {output_mode}."
         if output_mode == "coco_rle":
-            from pycocotools import mask as mask_utils  # type: ignore # noqa: F401
+            from pycocotools import mask as mask_utils  # type: ignore
 
         if min_mask_region_area > 0:
-            import cv2  # type: ignore # noqa: F401
+            import cv2  # type: ignore
 
         self.predictor = SamPredictor(model)
         self.points_per_batch = points_per_batch
@@ -134,7 +134,7 @@ class SamAutomaticMaskGenerator:
         self.output_mode = output_mode
 
     @torch.no_grad()
-    def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
+    def generate(self, image: np.ndarray) -> list[dict[str, Any]]:
         """
         Generates masks for the given image.
 
@@ -225,9 +225,9 @@ class SamAutomaticMaskGenerator:
     def _process_crop(
         self,
         image: np.ndarray,
-        crop_box: List[int],
+        crop_box: list[int],
         crop_layer_idx: int,
-        orig_size: Tuple[int, ...],
+        orig_size: tuple[int, ...],
     ) -> MaskData:
         # Crop the image and calculate embeddings
         x0, y0, x1, y1 = crop_box
@@ -266,9 +266,9 @@ class SamAutomaticMaskGenerator:
     def _process_batch(
         self,
         points: np.ndarray,
-        im_size: Tuple[int, ...],
-        crop_box: List[int],
-        orig_size: Tuple[int, ...],
+        im_size: tuple[int, ...],
+        crop_box: list[int],
+        orig_size: tuple[int, ...],
     ) -> MaskData:
         orig_h, orig_w = orig_size
 

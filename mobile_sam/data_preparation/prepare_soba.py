@@ -3,7 +3,6 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -19,9 +18,9 @@ class Ann:
     id: int
     image_id: int
     category_id: int  # 1=Object, 2=Shadow
-    association: Optional[int]
-    rle: Optional[Dict]
-    bbox: Tuple[float, float, float, float]
+    association: int | None
+    rle: dict | None
+    bbox: tuple[float, float, float, float]
 
 
 @dataclass
@@ -30,16 +29,16 @@ class Img:
     file_name: str
     width: int
     height: int
-    object_mask_path: Optional[str]
-    shadow_mask_path: Optional[str]
+    object_mask_path: str | None
+    shadow_mask_path: str | None
 
 
-def load_json(p: Path) -> Dict:
+def load_json(p: Path) -> dict:
     with p.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def to_bool_mask_from_rle(rle: Dict, h: int, w: int) -> np.ndarray:
+def to_bool_mask_from_rle(rle: dict, h: int, w: int) -> np.ndarray:
     if coco_mask is None:
         raise RuntimeError("pycocotools is required to decode RLE masks")
     cnts = rle.get("counts")
@@ -55,15 +54,14 @@ def to_bool_mask_from_rle(rle: Dict, h: int, w: int) -> np.ndarray:
     return m.astype(np.uint8)
 
 
-
-def load_mask_from_png(p: Path, shape: Tuple[int, int]) -> np.ndarray:
+def load_mask_from_png(p: Path, shape: tuple[int, int]) -> np.ndarray:
     arr = np.array(Image.open(p).convert("L"))
     if arr.shape != shape:
         arr = np.array(Image.fromarray(arr).resize((shape[1], shape[0]), Image.NEAREST))
     return (arr > 0).astype(np.uint8)
 
 
-def sample_point(mask: np.ndarray, rng: random.Random) -> Tuple[int, int]:
+def sample_point(mask: np.ndarray, rng: random.Random) -> tuple[int, int]:
     ys, xs = np.nonzero(mask)
     if ys.size == 0:
         raise ValueError("Empty object mask")
@@ -81,14 +79,16 @@ def save_image(src: Path, dst: Path) -> None:
     Image.open(src).save(dst, quality=95)
 
 
-def save_point_json(img_rel: str, point: Tuple[int, int], out_path: Path) -> None:
+def save_point_json(img_rel: str, point: tuple[int, int], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         json.dump({"image": img_rel, "point": [point[0], point[1]]}, f, ensure_ascii=False)
 
 
-def build_indices(meta: Dict) -> Tuple[Dict[int, Img], Dict[int, List[Ann]], Dict[int, Dict[int, List[Ann]]]]:
-    images: Dict[int, Img] = {}
+def build_indices(
+    meta: dict,
+) -> tuple[dict[int, Img], dict[int, list[Ann]], dict[int, dict[int, list[Ann]]]]:
+    images: dict[int, Img] = {}
     for im in meta["images"]:
         images[im["id"]] = Img(
             id=im["id"],
@@ -98,7 +98,7 @@ def build_indices(meta: Dict) -> Tuple[Dict[int, Img], Dict[int, List[Ann]], Dic
             object_mask_path=im.get("object_mask_path"),
             shadow_mask_path=im.get("shadow_mask_path"),
         )
-    anns_by_image: Dict[int, List[Ann]] = {}
+    anns_by_image: dict[int, list[Ann]] = {}
     for an in meta["annotations"]:
         ann = Ann(
             id=an["id"],
@@ -111,9 +111,9 @@ def build_indices(meta: Dict) -> Tuple[Dict[int, Img], Dict[int, List[Ann]], Dic
         anns_by_image.setdefault(ann.image_id, []).append(ann)
 
     # group by association id per image
-    groups: Dict[int, Dict[int, List[Ann]]] = {}
+    groups: dict[int, dict[int, list[Ann]]] = {}
     for img_id, anns in anns_by_image.items():
-        g: Dict[int, List[Ann]] = {}
+        g: dict[int, list[Ann]] = {}
         for a in anns:
             if a.association is None:
                 # skip items without association
@@ -123,9 +123,7 @@ def build_indices(meta: Dict) -> Tuple[Dict[int, Img], Dict[int, List[Ann]], Dic
     return images, anns_by_image, groups
 
 
-def resolve_pair_masks(
-    root: Path, img: Img, anns: List[Ann]
-) -> Tuple[np.ndarray, np.ndarray]:
+def resolve_pair_masks(root: Path, img: Img, anns: list[Ann]) -> tuple[np.ndarray, np.ndarray]:
     h, w = img.height, img.width
 
     obj_mask = np.zeros((h, w), dtype=np.uint8)
@@ -149,7 +147,7 @@ def resolve_pair_masks(
     return obj_mask, sh_mask
 
 
-def save_image_with_point(src: Path, dst: Path, point: Tuple[int, int]) -> None:
+def save_image_with_point(src: Path, dst: Path, point: tuple[int, int]) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     img = Image.open(src).convert("RGB")
     draw = ImageDraw.Draw(img)
@@ -161,7 +159,12 @@ def save_image_with_point(src: Path, dst: Path, point: Tuple[int, int]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--soba_root", type=Path, required=True, help="Path to SOBA root (folder containing SOBA/ and annotations/)")
+    ap.add_argument(
+        "--soba_root",
+        type=Path,
+        required=True,
+        help="Path to SOBA root (folder containing SOBA/ and annotations/)",
+    )
     ap.add_argument("--ann_json", type=Path, required=True, help="Path to annotations JSON")
     ap.add_argument("--out_dir", type=Path, required=True, help="Output dataset directory")
     ap.add_argument("--seed", type=int, default=42)

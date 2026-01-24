@@ -2,36 +2,20 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Tuple, Literal
+from typing import Literal
 
-from rich.logging import RichHandler
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
 
 from mobile_sam.build_sam import sam_model_registry
+from mobile_sam.common import get_logger
 
-import logging
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[
-        RichHandler(
-            rich_tracebacks=True,
-            show_time=True,
-            show_path=False
-        )
-    ]
-)
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
-def modules_to_prune(model: nn.Module, include_linear: bool) -> List[Tuple[nn.Module, str]]:
-    targets: List[Tuple[nn.Module, str]] = []
+def modules_to_prune(model: nn.Module, include_linear: bool) -> list[tuple[nn.Module, str]]:
+    targets: list[tuple[nn.Module, str]] = []
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
             targets.append((m, "weight"))
@@ -56,7 +40,7 @@ def remove_pruning_reparam(model: nn.Module) -> None:
 def sparsity_report(model: nn.Module) -> str:
     total = 0
     zero = 0
-    lines: List[str] = []
+    lines: list[str] = []
     for name, p in model.named_parameters():
         if p is None:
             continue
@@ -74,7 +58,12 @@ def sparsity_report(model: nn.Module) -> str:
 
 def apply_pruning(
     model: nn.Module,
-    mode: Literal["global_l1_unstructured", "layer_l1_unstructured", "layer_ln_structured", "random_unstructured"],
+    mode: Literal[
+        "global_l1_unstructured",
+        "layer_l1_unstructured",
+        "layer_ln_structured",
+        "random_unstructured",
+    ],
     amount: float,
     include_linear: bool,
     structured_n: int,

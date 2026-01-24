@@ -8,8 +8,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from typing import Tuple
-
 from ..modeling import Sam
 from .amg import calculate_stability_score
 
@@ -82,7 +80,8 @@ class SamOnnxModel(nn.Module):
         )
 
         prepadded_size = self.resize_longest_image_size(orig_im_size, self.img_size).to(torch.int64)
-        masks = masks[..., : prepadded_size[0], : prepadded_size[1]]  # type: ignore
+        # masks = masks[..., : prepadded_size[0], : prepadded_size[1]]  # type: ignore
+        masks = masks[..., :1024, :1024]  # type: ignore
 
         orig_im_size = orig_im_size.to(torch.int64)
         h, w = orig_im_size[0], orig_im_size[1]
@@ -91,7 +90,7 @@ class SamOnnxModel(nn.Module):
 
     def select_masks(
         self, masks: torch.Tensor, iou_preds: torch.Tensor, num_points: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Determine if we should return the multiclick mask or not from the number of points.
         # The reweighting is used to avoid control flow.
         score_reweight = torch.tensor(
