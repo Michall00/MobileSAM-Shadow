@@ -11,9 +11,6 @@ segmentation.
 This repository is a research fork of the original MobileSAM project:
 https://github.com/ChaoningZhang/MobileSAM
 
-The original architecture and inference pipeline remain unchanged.
-All contributions introduced here are limited to dataset preparation,
-training, and model export.
 
 ## Motivation
 
@@ -47,13 +44,6 @@ The following datasets were used:
   https://github.com/bcmi/Object-Reflection-Generation-Dataset-DEROBA
 
 
-## Training and Fine-Tuning
-
-Fine-tuning was performed on artifact-augmented datasets using the
-original MobileSAM training pipeline, with modified supervision
-targets that include artifact regions.
-
-No architectural changes were introduced.
 
 ## Qualitative Results
 
@@ -112,6 +102,56 @@ uv venv
 source .venv/bin/activate
 uv sync
 ```
+
+## Training and Fine-Tuning
+
+Fine-tuning was performed on artifact-augmented datasets using the
+original MobileSAM training pipeline, with modified supervision
+targets that include artifact regions.
+
+No architectural changes were introduced.
+
+## Model Optimization (Pruning and Quantization)
+
+As part of the research conducted in the associated engineering thesis,
+the fine-tuned MobileSAM models were further optimized for mobile
+deployment using:
+
+- structured and unstructured weight pruning
+- quantization-aware training (QAT)
+
+These techniques were applied to reduce model size and inference cost
+while preserving segmentation quality, particularly in artifact-aware
+scenarios.
+
+## Training Overview
+
+Model fine-tuning follows the original MobileSAM training pipeline,
+with modifications limited to the supervision targets to include
+artifact regions (shadows and reflections).
+
+The training process consists of:
+1. dataset preparation with artifact-aware masks
+2. fine-tuning using the original MobileSAM training scripts
+3. optional model optimization (pruning / QAT)
+4. export to ONNX for downstream deployment
+
+This repository is not intended to provide a full end-to-end training
+tutorial. Users interested in reproducing the experiments should refer
+to the original MobileSAM documentation and adapt the provided data
+preparation scripts.
+
+## Configuration
+
+Training, optimization, and export parameters are controlled via
+configuration files to enable systematic experimentation and
+reproducibility.
+
+The configuration mechanism allows adjusting, among others:
+- dataset paths and preprocessing options
+- training and fine-tuning settings
+- optimization flags (e.g. pruning, quantization)
+- expo
 
 ## ONNX Export
 

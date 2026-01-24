@@ -20,20 +20,20 @@ data:
     noise: false
 
   reflection:
-    root_dir: "C:\\Users\\msado\\Studia\\MobileSAM\\MobileSAM-Shadow\\data\\DEROBA_test2"
-    images_dir: "${data.reflection.root_dir}\\images"
-    masks_dir: "${data.reflection.root_dir}\\masks"
-    obj_masks_dir: "${data.reflection.root_dir}\\object_masks"
+    root_dir: "data/DEROBA"
+    images_dir: "${data.reflection.root_dir}/images"
+    masks_dir: "${data.reflection.root_dir}/masks"
+    obj_masks_dir: "${data.reflection.root_dir}/object_masks"
   shadow:
-    root_dir: "C:\\Users\\msado\\Studia\\MobileSAM\\MobileSAM-Shadow\\data\\prepared_soba"
-    images_dir: "${data.shadow.root_dir}\\images_test"
-    masks_dir: "${data.shadow.root_dir}\\masks_test"
-    obj_masks_dir: "${data.shadow.root_dir}\\object_masks_test"
+    root_dir: "data/Shadow"
+    images_dir: "${data.shadow.root_dir}/images_test"
+    masks_dir: "${data.shadow.root_dir}/masks_test"
+    obj_masks_dir: "${data.shadow.root_dir}/object_masks_test"
   normal:
-    root_dir: "C:\\Users\\msado\\Studia\\MobileSAM\\MobileSAM-Shadow\\data\\DEROBA_test2"
-    images_dir: "${data.normal.root_dir}\\images_without_reflection"
-    masks_dir: "${data.normal.root_dir}\\object_masks"
-    obj_masks_dir: "${data.normal.root_dir}\\object_masks"
+    root_dir: "data/DEROBA"
+    images_dir: "${data.normal.root_dir}/images_without_reflection"
+    masks_dir: "${data.normal.root_dir}/object_masks"
+    obj_masks_dir: "${data.normal.root_dir}/object_masks"
 
 model:
   type: "vit_t"
