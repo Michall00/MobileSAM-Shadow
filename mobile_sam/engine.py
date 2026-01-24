@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from PIL import ImageDraw
 from torch.utils.data import DataLoader
-from torchao.quantization import Int8DynamicActivationInt4WeightConfig
+from torchao.quantization import Int8DynamicActivationInt8WeightConfig
 from torchao.quantization.qat import QATConfig
 from torchao.quantization.quant_api import quantize_
 from tqdm import tqdm
@@ -76,7 +76,7 @@ class Trainer:
         if self.qat_enabled:
             log.info("Preparing model for Int8 Weight + Int8 Activation QAT")
 
-            self.base_config = Int8DynamicActivationInt4WeightConfig(group_size=32)
+            self.base_config = Int8DynamicActivationInt8WeightConfig(group_size=32)
             qat_config = QATConfig(self.base_config, step="prepare")
             self.model.to("cpu")
             quantize_(self.model, qat_config)
@@ -105,7 +105,7 @@ class Trainer:
             )
         elif scheduler_type == "constant":
             self.scheduler = torch.optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=9999, gamma=1.0
+                self.optimizer, gamma=1.0
             )
         else:
             log.warning(f"Unknown scheduler type '{scheduler_type}', defaulting to cosine.")
