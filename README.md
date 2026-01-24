@@ -44,6 +44,47 @@ The following datasets were used:
   https://github.com/bcmi/Object-Reflection-Generation-Dataset-DEROBA
 
 
+### Dataset Preparation
+
+The original datasets are not directly compatible with the MobileSAM
+training pipeline. Therefore, custom data preparation scripts are
+provided to convert raw annotations into an artifact-aware format
+suitable for fine-tuning.
+
+- `mobile_sam/data_preparation/prepare_soba.py`  
+  Converts the SOBA dataset into an artifact-aware training format by
+  extracting shadow masks and aligning them with object regions.
+
+- `mobile_sam/data_preparation/prepare_deroba.py`  
+  Converts the DEROBA dataset into an artifact-aware training format by
+  generating reflection-aware masks and unifying annotation structure.
+
+### Expected Dataset Structure
+
+Each prepared dataset is expected to follow the directory structure below:
+
+dataset_root/
+├── images/
+│   ├── 0001.jpg
+│   ├── 0002.jpg
+│   └── ...
+├── masks/
+│   ├── 0001.png
+│   ├── 0002.png
+│   └── ...
+└── object_masks/
+    ├── 0001.png
+    ├── 0002.png
+    └── ...
+
+
+### Using Custom Datasets
+
+Custom datasets can be used by preparing data in the same directory
+structure and providing both artifact-aware masks and object-only masks.
+
+This separation allows experimenting with different supervision schemes
+without modifying the training pipeline.
 
 ## Qualitative Results
 
@@ -157,7 +198,8 @@ MobileSAM export script:
 python scripts/export_onnx_model.py \
   --checkpoint weights/mobile_sam.pt \
   --model-type vit_t \
-  --output weights/mobile_sam_decoder.onnx
+  --output weights/mobile_sam_decoder.onnx \
+  --return-single-mask
 ```
 
 To export the image encoder:
