@@ -63,6 +63,7 @@ suitable for fine-tuning.
 
 Each prepared dataset is expected to follow the directory structure below:
 
+```
 dataset_root/
 ├── images/
 │   ├── 0001.jpg
@@ -76,7 +77,7 @@ dataset_root/
     ├── 0001.png
     ├── 0002.png
     └── ...
-
+```
 
 ### Using Custom Datasets
 
